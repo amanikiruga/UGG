@@ -274,6 +274,7 @@ VWM_SKIP_STARTUP_CHECKPOINT=1 python -m main +name=full_smoke experiment=ugg_tra
 | batch | 8 per GPU × 24 H200 = 192 |
 | optimizer | AdamW (fp32 state), lr 6e-6 constant after 150 warmup steps, betas (0.9, 0.95), wd 0.05, clip 1.0 |
 | memory | FSDP hybrid shard within node, `use_orig_params`, gradient checkpointing 0.93 |
+| hardware | at least 4 × 80 GB GPUs per node: 3 × 80 GB runs forward and backward but OOMs at the first AdamW step |
 | speed | FA3, compiled VAE encoder, merged FLF chunks: ≈ 8.5 s/step |
 | release | step 2250 |
 
