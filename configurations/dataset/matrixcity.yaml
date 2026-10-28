@@ -1,0 +1,63 @@
+defaults:
+  - video_base
+  - _self_
+
+# MatrixCity (UE5 synthetic city, BoDai/MatrixCity) — STREET split only (aerial is a
+# grid scan, ~21% view change per frame: not continuous video). 1000x1000 fov-90 RGB,
+# float16 EXR z-depth sharing the pose unit (verified divisor 1), c2w OpenCV with
+# 0.01-scaled rotations (normalized in loader). Records = contiguous sweeps (split at
+# teleports). Convention verified: datasets/geometry_verification/matrixcity/
+# check_raw_reproj.py (street 1.1-1.3% NN-lookup floor; wrong hypotheses 6-194%).
+data_root: ${data_dir}/matrixcity
+metadata_path: ""
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/matrixcity
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+fps: 10
+fps_source: 10
+n_frames: 50
+test_percentage: 0.02
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# Measured 30 clips through the loader (2026-07-12): moment-max M50=124 M90=244;
+# depth p50-of-p50=1284, D90-of-p90=15917 units (city canyons run deep). Model-B
+# scheme max(M90, D90/9) = 1221 (re-measured over combined small+big city pool,
+# 2257 sweeps; big_city included 2026-07-12). NOTE: street sweeps have ZERO in-clip rotation
+# (grid roads, fixed heading) — pose supervision is pure translation; moments span
+# ~0.14 of range at this scale.
+mutual_scale: 12.21   # metres (was 1221 in cm; depth now converted to m via unit_to_meters)
+
+# CAMERAS KEPT (2026-07-14, user request — same as omniworld): has_raymap=True, pose IS
+# supervised. Restricted to diffusion_forcing setting [1] = clean RGB -> predict rays(pose)+
+# depth (no RGB-generation/NVS). Forward-dolly street moments are small but valid.
+# MatrixCity's geometry defect is POSE, not depth. Sweeping the frame gap (n=40):
+# its reprojection error grows 5.5x from gap1 to gap20 while vkitti2's is flat at 1.7x --
+# the signature of pose drift accumulating with baseline. At gap 1, where pose barely
+# contributes, MatrixCity is only 1.9x worse than vkitti2 (0.0056 vs 0.0029), putting its
+# DEPTH in the same band as mid_air. So drop the broken pose and keep the sound depth.
+depth_only: true
+
+# UNITS: MatrixCity street depth AND pose translation are in CENTIMETRES (UE5 world unit),
+# NOT metres — verified 2026-07-14 (road-ahead depth ~350-510 = 3.5-5.1 m; median ~13 m).
+# IRRELEVANT to scale_mode=parallax (normalizes by per-clip median depth -> dimensionless).
+# ONLY matters if a metric-scale conditioning token is ever added: use unit_to_meters=0.01.
+unit_to_meters: 0.01
+
+# one-time record-walk cache (scripts/build_records_manifest.py); instant startup after first build
+records_manifest: _records_manifest.json
+
+# Static scene -> temporal-reverse augmentation is a valid backward camera path (2026-07-13).
+allow_temporal_reverse: true

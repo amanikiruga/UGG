@@ -1,0 +1,50 @@
+defaults:
+  - video_base
+  - _self_
+
+# BEDLAM (Max Planck synthetic humans), used purely as a geometry source (RGB + metric
+# EXR depth + per-frame moving Unreal cameras). Supports both releases under one tree:
+#   v1: <batch>/png + <batch>/depth + <batch>/ground_truth/camera/*.csv
+#   v2: <batch>/png + <batch>/exr_depth + <batch>/ground_truth/meta_exr_csv/*.csv
+# Geometry is identical to TartanAir (OpenCV optical c2w, first-frame-identity, modified-
+# disparity depth, Plucker raymaps); see datasets/bedlam.py and
+# datasets/geometry_verification/bedlam/ (camera convention reproj-verified ~0.2% on
+# camera-moving orbit sequences; dynamic humans account for the residual vs Spring's ~0.05%).
+# BEDLAM v1 and v2 use the same loader; data_root selects the release.
+data_root: ${data_dir}/bedlam
+metadata_path: ""
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/bedlam
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+# BEDLAM is rendered at 30 fps; sample consecutively (fps == fps_source -> stride 1).
+# Sequences are ~130-450 frames so 50-frame clips fit. ~half of v1 batches (orbit/zoom/
+# pitch) have real camera motion; the rest are static-camera (depth-only supervision).
+fps: 30
+fps_source: 30
+n_frames: 50
+test_percentage: 0.02
+# Same target resolution + raymap grid as TartanAir so the datasets mix cleanly. Source is
+# 1280x720 (16:9); the loader center-crops to the 4:3 target aspect then resizes.
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# Per-dataset scale_preserving constant = this datasets measured depth-P90 (scripts/compute_global_scale.py).
+# scale_preserving=True divides BOTH depth and camera-moments by this so each datasets depth-disparity
+# distribution lands in the same ~[0.4,0.9] range -> datasets "look the same" (vs one global 30 that made
+# ASE 2-5m scenes saturate near +1 while vkitti2 130m spread to -1). metric scale preserved WITHIN each dataset.
+mutual_scale: 63.0
+
+# record-walk cache (scripts/build_records_manifest.py) — instant startup; delete if data changes
+records_manifest: _records_manifest.json

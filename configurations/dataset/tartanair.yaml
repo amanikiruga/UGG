@@ -1,0 +1,44 @@
+defaults:
+  - video_base
+  - _self_
+
+# TartanAir (CMU AirLab), left camera only, all 18 environments, Easy+Hard.
+# Loose directory tree (no squashfs).
+data_root: ${data_dir}/tartanair
+metadata_path: ""
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/tartanair
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+# Per-frame camera motion at stride 1 is already ~0.6-1.5 deg/frame and 0.07-0.14 m/frame
+# (measured over office/neighborhood/hospital/japanesealley), i.e. good NVS baseline over
+# 50 frames (~3-7 m, ~29-74 deg). So sample consecutively: fps == fps_source -> stride 1.
+fps: 10
+fps_source: 10
+n_frames: 50
+test_percentage: 0.02   # ~7 trajectories held out for validation/test
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# Per-dataset scale_preserving constant = this datasets measured depth-P90 (scripts/compute_global_scale.py).
+# scale_preserving=True divides BOTH depth and camera-moments by this so each datasets depth-disparity
+# distribution lands in the same ~[0.4,0.9] range -> datasets "look the same" (vs one global 30 that made
+# ASE 2-5m scenes saturate near +1 while vkitti2 130m spread to -1). metric scale preserved WITHIN each dataset.
+mutual_scale: 21.0
+
+# record-walk cache (scripts/build_records_manifest.py) — instant startup; delete if data changes
+records_manifest: _records_manifest.json
+
+# Static scene -> temporal-reverse augmentation is a valid backward camera path (2026-07-13).
+allow_temporal_reverse: true

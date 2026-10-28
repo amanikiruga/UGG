@@ -1,0 +1,9 @@
+# Concat 5B variant. Inherits the tested 5B overrides (Wan2.2-TI2V-5B model, v2 VAE
+# z_dim=48 stride[4,16,16], 5B text encoder) from wan_t2v_ray_depth_mot_5b, and the
+# 3-way concat token-fusion behavior + 8-bit AdamW from the algorithm class
+# WanTextToVideoRayDepthMoTConcat5B (routed by this config _name in
+# experiments/exp_video.py:compatible_algorithms). The model is API-compatible with the
+# 1.3B concat algorithm, so the full config is inherited unchanged.
+defaults:
+  - wan_t2v_ray_depth_mot_5b
+  - _self_

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+outputs/
+lightning_logs/
+wandb/
+slurm_logs/
+*.ckpt
+.hydra/

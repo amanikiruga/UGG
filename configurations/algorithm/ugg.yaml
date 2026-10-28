@@ -1,0 +1,54 @@
+# UGG release model: Wan2.2-TI2V-5B backbone, mixture-of-transformers over
+# [rgb | ray | depth], trained with diffusion forcing. Sampling defaults are the ones used
+# for the paper's evaluation; the training keys are the release fine-tuning recipe.
+# Override anything from the command line, e.g.
+#   python -m main algorithm=ugg algorithm.hist_guidance=2.0 algorithm.sample_steps=20
+defaults:
+  - wan_t2v_ray_depth_mot_concat_5b
+  - _self_
+
+model:
+  # Release weights (weights-only warm start; see configure_model).
+  tuned_ckpt_path: /n/lab_storage/ydu_lab/Lab/akiruga/world_model_4d/final_release_checkpoints/spdepth_2250_NVS25.7263_BEST.ckpt
+  compile: false
+  # Keep only the first N transformer blocks. Smoke tests only; null = full model.
+  debug_num_layers: null
+
+vae:
+  compile: false
+  encoder_compile: true    # torch.compile the VAE encoder: 2x faster training step (~145 s compile)
+  merge_flf_chunks: true   # 3 encoder passes instead of 14; mathematically exact
+
+text_encoder:
+  compile: false
+
+# ---- sampling ----------------------------------------------------------------------
+sample_steps: 40
+sample_solver: unipc
+sample_shift: 3.0
+hist_guidance: 1.0   # history (clean-frame) guidance; 0 disables the extra forward
+lang_guidance: 0.0   # text guidance; > 0 needs the T5 encoder (load_prompt_embed=false)
+neg_prompt: ""
+
+# ---- training recipe (inert at inference) -------------------------------------------
+gf_freeze_depth: true          # depth expert frozen; needs experiment.fsdp_use_orig_params
+gradient_checkpointing_rate: 0.93
+optimizer_impl: adamw           # adamw8bit halves optimizer memory but then needs experiment.training.checkpointing.save_weights_only=true (FSDP cannot gather its mixed-dtype state)
+rescale_lr_on_resume: true          # resume keeps the configured LR, not the one saved in the ckpt
+rng_allow_world_size_change: true   # resuming on a different GPU count re-derives per-rank RNG
+lr_scheduler:
+  name: warmup_hold_cosine
+  num_warmup_steps: 150
+  num_hold_steps: 999999       # with min_lr_rate 1.0: constant LR after warmup
+  num_training_steps: 1000000
+  min_lr_rate: 1.0
+
+diffusion_forcing:
+  enabled: true
+  mode: ray_depth_prediction_firstlast
+  train_rgb: true
+  depth_loss_weight: 1.0
+  mask_clean_token_loss: true
+  subset_settings:
+    tartanair: [0, 1, 2, 3, 4]
+    re10k: [0, 1, 2, 3]

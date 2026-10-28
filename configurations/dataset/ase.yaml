@@ -1,0 +1,65 @@
+defaults:
+  - video_base
+  - _self_
+
+# ASE (Aria Synthetic Environments), 20,880 scenes, fisheye RGB + GT range-depth + poses.
+# Data is 58 SquashFS images; mount first (per node):
+#   /projects/u6el/aak81/datasets/projectaria/mount_ase.sh /tmp/ase
+# -> scenes at /tmp/ase/scenes/<id>/{rgb,depth,trajectory.csv}. Frames are fisheye and are
+# undistorted on-the-fly to a 640x480 pinhole via datasets/geometry_verification/aria/
+# ase_undistort_maps.npz (~96 ms / 50-frame clip / worker; geometry verified to 0.08%).
+# Per-task mount path (srun isolates mount namespaces, so each task mounts ASE itself to a
+# per-LOCALID path and exports ASE_DATA_ROOT). Falls back to /tmp/ase/scenes for interactive use.
+# Absolute by design: every other subset hardcodes its root, and the previous
+# ${oc.env:ASE_DATA_ROOT} indirection meant anyone running this had to be told the path
+# out of band. It also silently changed the records-manifest cache key when the variable
+# was unset or stale, so a run could miss the cached record list without any error.
+# This one directory holds the complete corpus: 92,290 scenes (91,368 train + 922 val).
+data_root: ${data_dir}/ase
+metadata_path: ""
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/ase
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+fps: 10
+fps_source: 10
+n_frames: 50
+test_percentage: 0.01
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# PER-CLIP motion gate (2026-07-08): ASE is head-mounted walking at an INTRINSIC 10 fps
+# (trajectory.csv steps 100ms; fps==fps_source -> stride 1, no denser frames exist), so some
+# sampled windows rotate ~10+ deg/frame — far outside the mixture's motion family (others
+# 0.1–5 deg/frame). Windows exceeding either threshold train DEPTH ONLY: the loader drops
+# the camera keys -> has_raymap=False -> ray tokens noise-filled + loss-masked, and the
+# algorithm bars rays-as-history settings (2/3) for such samples. Calm windows keep full
+# raymap+depth supervision. Set both to null to disable the gate.
+# GATE DISABLED (2026-07-13, user request): ASE keeps camera/raymap supervision on ALL
+# clips, including fast head-mounted rotation (~10 deg/frame is normal for Aria walking).
+raymap_max_rot_deg_per_frame: null
+raymap_max_parallax: null
+
+# Per-dataset scale_preserving constant = this datasets measured depth-P90 (scripts/compute_global_scale.py).
+# scale_preserving=True divides BOTH depth and camera-moments by this so each datasets depth-disparity
+# distribution lands in the same ~[0.4,0.9] range -> datasets "look the same" (vs one global 30 that made
+# ASE 2-5m scenes saturate near +1 while vkitti2 130m spread to -1). metric scale preserved WITHIN each dataset.
+mutual_scale: 4.5
+
+# Static scene -> temporal-reverse augmentation is a valid backward camera path (2026-07-13).
+allow_temporal_reverse: true
+
+# records-manifest cache (video_base._load_records_cached): first run walks + writes
+# the JSON to the central manifest dir; every later startup loads it instantly.
+records_manifest: _records_manifest.json

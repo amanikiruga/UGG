@@ -1,0 +1,50 @@
+defaults:
+  - video_base
+  - _self_
+
+data_root: ${data_dir}/omniworld_game
+metadata_path: metadata.csv
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/omniworld_game
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+max_mean_adj_rotation_deg: 3.5
+fps: 24      # calibrated (tune_fps @ 50 samples; target ~0.45°/frame via re10k pivot)
+n_frames: 49
+test_percentage: 0.01
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+# FULL GEOMETRY (2026-07-14, user request): include OmniWorld's game-recorded cameras
+# (raymaps/extrinsics) -> has_raymap=True, full diffusion_forcing settings [0,1,2,3,4].
+# High-rotation clips are still dropped by max_mean_adj_rotation_deg=3.5 above for pose quality.
+# OmniWorld is game footage: its geometry is self-consistent (reprojection error 0.0029,
+# on par with tartanair's 0.0019) but NOT metric -- median scene depth is 0.030 engine
+# units, and its camera height measures 0.0063 m. Its pose is also near-degenerate for
+# this roster: measured 0.225 deg/frame and a moment channel of only 0.02 of range.
+# So take the depth (real supervision, scale-ambiguous) and drop the pose: depth_only
+# omits the camera keys, MixtureDataset sets has_raymap=False, and the algorithm
+# noise-fills and loss-masks every ray token.
+depth_only: true
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# Per-dataset scale_preserving constant = depth-P90, measured 2026-07-07 over 50
+# clips (datasets/global_scale_omniworld.json: depthP50 0.025 / P90 0.19 / P95 0.41,
+# momentP95 0.021). OmniWorld-Game world units are game-engine-arbitrary (~100x
+# smaller than metres) but depth and camera moments are mutually consistent, so
+# dividing both by this constant preserves scale WITHIN the dataset:
+# moments land at p95/scale ~ 0.11 (unclipped) and disparity spreads the bulk of depths.
+mutual_scale: 0.19
+
+# record-walk cache (scripts/build_records_manifest.py) — instant startup; delete if data changes
+records_manifest: _records_manifest.json

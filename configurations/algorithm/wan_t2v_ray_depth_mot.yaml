@@ -1,0 +1,139 @@
+defaults:
+  - base_pytorch_algo
+  - _self_
+
+lr: ${experiment.training.lr}
+betas: [0.9, 0.95]
+weight_decay: 5e-2
+lr_scheduler:
+  name: constant_with_warmup
+  num_warmup_steps: 1000
+
+load_video_latent: ${dataset.load_video_latent}
+load_prompt_embed: ${dataset.load_prompt_embed}
+
+diffusion_forcing:
+  enabled: true
+  mode: ray_depth_prediction_firstlast  # independent, rand_history, ray_prediction
+  clean_hist_prob: 0.5
+  # Supervise the RGB stream (generative modality). True => total_loss = mean(rgb, ray_d,
+  # ray_m, depth). False => RGB is clean conditioning only, geometry-only loss (old run).
+  train_rgb: true
+  # 1.0 = original equal-weight mean over rgb/ray_d/ray_m/depth. >1 biases toward depth.
+  depth_loss_weight: 1.0
+  # Exclude tokens at t == 0 (clean CONTEXT, not prediction targets) from the flow loss.
+  # At t == 0 the input equals the clean latent, so the target (noise - x0) still contains
+  # the unobservable noise draw -> supervising it is pure gradient variance. Worst case is
+  # setting 1 with a clean_hist_prob hit, where every RGB frame is clean yet the RGB term
+  # still contributed 1/4 of total_loss.
+  # true = correct objective (default for new runs).
+  # false = the pre-fix behaviour; set it to reproduce runs trained before 2026-08-05
+  mask_clean_token_loss: true
+  # Per-subset eligible settings for ray_depth_prediction_firstlast (0-indexed).
+  # Hard-fail if a batch's subset_id is not a key here.
+  #   0 = first RGB history, rest future
+  #   1 = all RGB history, rays + depth future
+  #   2 = first+last RGB history, all rays history, middle RGB+depth future
+  #   3 = first RGB history, all rays history, remaining RGB+depth future
+  #   4 = first RGB history, all depth history, remaining RGB+pose future
+  subset_settings:
+    # Synthetic / full-geometry subsets (perfect RGB+rays+depth GT) -> ALL settings.
+    tartanair:      [0, 1, 2, 3, 4]
+    tartanair_v2:   [1]              # cameras kept; clean RGB -> rays(pose)+depth (no RGB gen)
+    spring:         [0, 1, 2, 3, 4]
+    bedlam:         [0, 1, 2, 3, 4]
+    bedlam2:        [0, 1, 2, 3, 4]
+    point_odyssey:  [0, 1, 2, 3, 4]
+    vkitti2:        [0, 1, 2, 3, 4]
+    ase:            [1]              # cameras kept; clean RGB -> rays(pose)+depth (no RGB gen)
+    mid_air:        [0, 1, 2, 3, 4]
+    mvs_synth:      [0, 1, 2, 3, 4]
+    # matrixcity: cameras EXCLUDED (depth_only=true, has_raymap=False). Its pose drifts
+    # (5.5x reprojection growth over the gap sweep vs vkitti2's 1.7x) but its depth is
+    # sound, so it contributes depth supervision only; ray tokens are loss-masked.
+    matrixcity:     [1]
+    # omniworld: cameras EXCLUDED (depth_only=true, has_raymap=False). Its depth is
+    # accurate but non-metric and its pose is near-degenerate (0.225 deg/frame), so it
+    # contributes depth supervision only; ray tokens are noise-filled and loss-masked.
+    omniworld_game: [1]
+    dl3dv:          [0, 1, 2, 3, 4]
+    scannetpp:      [1]
+    scenenet_depth: [1]
+    scenenet:       [1]              # camera-aware (real GT poses); clean RGB -> rays(pose)+depth
+    # NVS-ONLY subsets (no depth; rays as history, predict RGB — never predict pose):
+    # 2 = first+last RGB + all rays history -> middle RGB, 3 = first RGB + all rays -> rest RGB.
+    # Their absent depth is auto-masked (has_depth=False -> t=1 + loss mask).
+    re10k:          [2, 3]
+    dl3dv_colmap:   [2, 3]
+    spatialvid_nvs: [0, 2, 3]
+    agibot_world:   [0]
+
+n_frames: ${dataset.n_frames}
+height: ${dataset.height}
+width: ${dataset.width}
+num_train_timesteps: 1000
+diffusion_type: "continuous"
+sample_solver: unipc
+sample_steps: 40
+sample_shift: 3.0
+lang_guidance: 0.0
+neg_prompt: ""
+hist_guidance: 2.0
+sliding_hist: 1
+# fp32 AdamW (default) vs bitsandbytes adamw8bit. fp32 is required for full-state
+# checkpointing: 8-bit's heterogeneous state dtypes trip FSDP's full optim-state gather,
+# leaving only weights-only saves, i.e. no true resume (Adam state + LR warmup reset).
+optimizer_impl: adamw
+gradient_checkpointing_rate: 0.5
+max_text_tokens: 512
+
+logging:
+  loss_freq: 1
+  video_freq: 1000
+  video_type: grid
+  fps: ${dataset.fps}
+
+serving:
+  port: 6688
+
+text_encoder:
+  text_len: 512
+  text_dim: 4096
+  compile: true
+  name: google/umt5-xxl
+  ckpt_path: Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+
+vae:
+  ckpt_path: Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+  compile: true
+  # VAE-encode speedups. Both default OFF: nothing changes unless you opt in.
+  # NOTE `compile` above wraps self.vae, which torch.compile cannot trace into
+  # (the VAE is driven through encode(), not forward()) -- these are the ones that work.
+  #   encoder_compile   : torch.compile(self.vae.encoder). Any VAE.
+  #   merge_flf_chunks  : 3 encoder passes instead of 14. v2 FLF VAE (5B) ONLY --
+  #                       hard-asserts on anything else. Mathematically exact.
+  # Together on H200: encode 9.71 -> 2.05 s, training step 17.5 -> 8.5 s/step (2.06x).
+  encoder_compile: false
+  merge_flf_chunks: false
+  z_dim: 16
+  stride: [4, 8, 8]
+  mean: [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921]
+  std: [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160]
+
+model:
+  ckpt_path: Wan-AI/Wan2.1-T2V-1.3B
+  tuned_ckpt_path: null
+  compile: true   # was false; now compile-safe (.item() hoisted) -> ~2.3x real_util (20%->48%)
+  model_type: t2v
+  patch_size: [1, 2, 2]
+  in_dim: ${algorithm.vae.z_dim}
+  dim: 1536
+  ffn_dim: 8960
+  freq_dim: 256
+  out_dim: ${algorithm.vae.z_dim}
+  num_heads: 12
+  num_layers: 30
+  window_size: [-1, -1]
+  qk_norm: True
+  cross_attn_norm: True
+  eps: 1e-6

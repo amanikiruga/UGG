@@ -1,0 +1,42 @@
+defaults:
+  - video_base
+  - _self_
+
+# MVS-Synth (DeepMVS): 120 GTA-V sequences x 100 frames, 960x540, per-frame K,
+# w2c extrinsics (OpenCV axes), float32 EXR z-depth in metres (inf = sky).
+# Convention verified: datasets/geometry_verification/mvs_synth/check_raw_reproj.py
+# (0.08-0.13% median rel depth reproj error on 3 seqs; wrong hypotheses 6-50%/off-screen).
+data_root: ${data_dir}/mvs_synth
+metadata_path: ""
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/mvs_synth
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+# Nominal capture rate unknown (GTA video, sizeable per-frame baselines); stride 1.
+# Validate rot/frame + parallax in the loader battery before mixing.
+fps: 10
+fps_source: 10
+n_frames: 50
+test_percentage: 0.02
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# Measured 30 clips through the loader (2026-07-12): per-clip moment-max M50=25 M90=50
+# M95=69; depth p50-of-p50=216m, D90-of-p90=712m. Model-B scheme max(M90, D90/9)=79.
+# Motion note: rot/frame p50=3.3deg p90=4.5deg, 27% of clips >4deg/frame (fast GTA
+# camera moves) — consider an ASE-style motion gate if ray supervision looks noisy.
+mutual_scale: 79.0
+
+# one-time record-walk cache (scripts/build_records_manifest.py); instant startup after first build
+records_manifest: _records_manifest.json

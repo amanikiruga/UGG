@@ -1,0 +1,34 @@
+# Release fine-tuning recipe: 6 nodes x 4 H200, batch 8/GPU (global 192), constant LR 6e-6,
+# grad clip 1.0, checkpoint every 150 steps. The released weights are step 2250.
+defaults:
+  - exp_video
+  - _self_
+
+tasks: [training]
+num_nodes: 1
+fsdp_use_orig_params: true     # required by algorithm.gf_freeze_depth (mixed requires_grad)
+fsdp_shard_within_node: true   # HYBRID_SHARD: shard over the GPUs of a node, replicate across nodes
+pg_timeout_min: 90
+
+training:
+  lr: 6e-6
+  batch_size: 8
+  max_steps: 90000
+  async_checkpointing: true
+  checkpointing:
+    every_n_train_steps: 150
+    save_weights_only: false   # fp32 AdamW -> full-state resume works
+    save_last: link
+    save_top_k: -1
+  optim:
+    accumulate_grad_batches: 1
+    gradient_clip_val: 1.0
+  data:
+    num_workers: 10
+
+validation:
+  val_every_n_step: 100000
+  limit_batch: 0
+  num_sanity_val_steps: 0
+  data:
+    num_workers: 2

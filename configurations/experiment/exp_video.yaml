@@ -1,0 +1,51 @@
+defaults:
+  - base_pytorch
+  - _self_
+  
+tasks: [training]
+
+training:
+  # limit_val_batches: 0.0 # no validation remove validation
+  lr: 1e-5
+  precision: bf16-mixed
+  batch_size: 1
+  max_epochs: -1
+  max_steps: 10000000
+  # Write checkpoints from a background thread (Lightning AsyncCheckpointIO):
+  # training only blocks for the FSDP state gather, not the disk write.
+  async_checkpointing: true
+  checkpointing:
+    every_n_train_steps: 150
+    # every_n_train_steps: 1000
+    every_n_epochs: null
+    save_weights_only: true
+    # "link" -> last.ckpt is a symlink to the newest step ckpt instead of a
+    # second full multi-GB write per save (halves checkpoint I/O).
+    save_last: link
+    save_top_k: 3
+    monitor: "global_step"
+    mode: "max"
+  optim:
+    accumulate_grad_batches: 4
+    gradient_clip_val: null
+  data:
+      num_workers: 5 # number of CPU threads for data preprocessing.
+
+validation:
+  precision: bf16-mixed
+  val_every_n_step: 500
+  val_every_n_epoch: null
+  num_sanity_val_steps: 1 # run validation before training starts
+  batch_size: 1
+  limit_batch: 1
+  data:
+    num_workers: 1 # number of CPU threads for data preprocessing, for validation.
+
+test:
+  precision: bf16-mixed
+  limit_batch: null
+  batch_size: 1
+  data:
+    num_workers: 1 # number of CPU threads for data preprocessing, for test.
+
+find_unused_parameters: False

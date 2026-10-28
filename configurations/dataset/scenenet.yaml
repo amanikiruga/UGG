@@ -1,0 +1,31 @@
+defaults:
+  - video_base
+  - _self_
+
+data_root: ${data_dir}/scenenet
+gt_pose_root: ${data_dir}/scenenet_gt_poses
+metadata_path: metadata.csv
+load_prompt_embed: true
+caption_cache_dir: ${data_dir}/captions/scenenet
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+fps: 10        # target fps; matches mixture_3d (re10k pivot)
+n_frames: 49
+test_percentage: 0.0
+height: 240
+width: 320
+raymap_height: 30   # height // 8
+raymap_width: 40    # width  // 8
+
+filtering:
+  disable: true
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# records-manifest cache (video_base._load_records_cached): first run walks + writes
+# the JSON to the central manifest dir; every later startup loads it instantly.
+records_manifest: _records_manifest.json

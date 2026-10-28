@@ -1,0 +1,88 @@
+defaults:
+  - mixture_all              # the original 10 subsets + scale_mode/parallax_kappa declarations
+  - mvs_synth@subset/mvs_synth
+  - mid_air@subset/mid_air
+  - scenenet@subset/scenenet
+  - matrixcity@subset/matrixcity
+  - _self_
+
+# 13-dataset PARALLAX training mixture (scheme C — see SCALE_NORMALIZATION_ANALYSIS.md).
+# MatrixCity was removed 2026-08-27 for poor depth/pose consistency (median gap-15
+# reprojection 0.0419 vs vkitti2's 0.0023), then RESTORED DEPTH-ONLY 2026-08-29 after that
+# error was isolated to the POSE. Sweeping the frame gap (n=40 clips): MatrixCity's error
+# grows 5.5x from gap1 to gap20 while vkitti2's is flat at 1.7x -- pose drift accumulating
+# with baseline. At gap 1, where pose barely contributes, MatrixCity is only 1.9x worse
+# than vkitti2 (0.0056 vs 0.0029), putting its DEPTH in the same band as mid_air (0.0050).
+# So it now runs with depth_only=true: has_raymap=False, ray tokens noise-filled and
+# loss-masked, depth gauged on the clip's own median (the camera-motion gauge left 92% of
+# its clips crushed). Restored at its original ~4% share.
+# Launch with dataset.scale_mode=parallax (kappa default 4). Lineup:
+#   full geometry [0,1,2,3,4]: tartanair, spring, bedlam, bedlam2, vkitti2, mvs_synth, mid_air
+#   RGB->depth+pose [1]:       ase (gate removed), tartanair_v2, scenenet (real GT poses),
+#                              omniworld_game — cameras kept (has_raymap=True, pose
+#                              supervised), clean RGB history -> predict rays+depth, NO RGB gen/NVS
+#   NVS pose+RGB   [2,3]:      re10k, dl3dv_colmap (no metric depth -> depth channel unaffected;
+#                              under parallax+companded_origin their ray channels DO follow the
+#                              co encoding, gauged by per-clip max origin instead of κ·median depth)
+#   EXCLUDED: point_odyssey, dl3dv (depth variant), scenenet_depth (superseded by camera-aware scenenet)
+#
+# Weights: weight_type=relative => sampling share_i ∝ weight_i × n_records_i. weight computed
+# as target_share_i / n_records_i (scaled). Target shares (%): tartanair 18, tartanair_v2 15,
+# re10k 11 (throughput cap), dl3dv_colmap 9, ase 8, bedlam 7, bedlam2 7, scenenet 6 (camera-aware, real poses),
+# omniworld 5, vkitti2 4, mvs_synth 2.5, mid_air 2.5, spring 1 (matrixcity's 4% is
+# redistributed proportionally; repetition caps
+# on the tiny sets; TartanAir promoted as the best/most-diverse geometry). Sizes measured
+# 2026-07-13 through the exact loaders.
+mixture_seed: 20260831   # fixed sampling stream
+
+training:
+  weight_type: relative
+  weight:
+    tartanair: 0.6077
+    tartanair_v2: 0.106353
+    re10k: 0.002684
+    ase: 0.001067          # 8.33% -- ASE's manifest now covers all 91,368 scenes
+                           # (was 37,373: see the dataset audit). At the old 0.0027 the
+                           # full pool would take 18.7% instead of its target share.
+    dl3dv_colmap: 0.0141   # 9%
+    bedlam: 0.0110
+    bedlam2: 0.0152
+    scenenet: 0.0043
+    omniworld_game: 0.0086
+    vkitti2: 0.4889
+    mvs_synth: 0.2589
+    mid_air: 0.1617
+    spring: 0.3395
+    matrixcity: 0.0220     # ~4% share (2,212 records); DEPTH-ONLY, see header
+validation:
+  weight_type: absolute
+  weight:
+    tartanair: 1.0
+    tartanair_v2: 1.0
+    spring: 1.0
+    bedlam: 1.0
+    bedlam2: 1.0
+    vkitti2: 1.0
+    ase: 1.0
+    omniworld_game: 1.0
+    re10k: 1.0
+    dl3dv_colmap: 1.0
+    mvs_synth: 1.0
+    mid_air: 1.0
+    scenenet: 1.0
+test:
+  weight_type: absolute
+  weight:
+    tartanair: 1.0
+    tartanair_v2: 1.0
+    spring: 1.0
+    bedlam: 1.0
+    bedlam2: 1.0
+    vkitti2: 1.0
+    ase: 1.0
+    omniworld_game: 1.0
+    re10k: 1.0
+    dl3dv_colmap: 1.0
+    mvs_synth: 1.0
+    mid_air: 1.0
+    scenenet: 1.0

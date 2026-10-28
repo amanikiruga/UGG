@@ -1,0 +1,21 @@
+# configuration parsing starts here
+defaults:
+  - experiment: exp_video # experiment yaml file name in configurations/experiment folder
+  - dataset: mixture_parallax14 # dataset yaml file name in configurations/dataset folder
+  - algorithm: ugg # algorithm yaml file name in configurations/algorithm folder
+  - cluster: null # optional, cluster yaml file name in configurations/cluster folder. Leave null for local compute
+  - _self_
+
+# Root of the training datasets; each dataset yaml reads ${data_dir}/<name> (see README).
+data_dir: ???
+
+debug: false # global debug flag will be passed into configuration of experiment, dataset and algorithm
+
+wandb:
+  entity: your-wandb-entity # wandb account name / organization name [fixme]
+  project: ugg # wandb project name
+  mode: online # set wandb logging to online, offline or dryrun
+  log_model: false # whether log ckpt and upload to wandb. "all" is recommended but may take a lot of space
+
+resume: null # wandb run id to resume logging and loading checkpoint from
+load: null # wanmdb run id containing checkpoint or a path to a checkpoint file 

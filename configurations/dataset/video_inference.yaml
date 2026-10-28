@@ -1,0 +1,11 @@
+# Input geometry for inference (288x384, up to 50 frames with M % 4 == 2).
+# The per-clip frame count is set from the input video at run time.
+height: 288
+width: 384
+n_frames: 50
+raymap_height: 36   # unused at inference: rays are predicted, the input raymap is all zeros
+raymap_width: 48
+fps: 10
+load_prompt_embed: true   # the DiT reads prompt embeddings; T5 is loaded on demand (ugg/pipeline.py)
+load_video_latent: false
+max_text_tokens: 512

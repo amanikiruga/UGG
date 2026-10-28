@@ -1,0 +1,12 @@
+# Random tensors with the training-sample schema; for smoke tests only.
+height: 288
+width: 384
+n_frames: 50
+raymap_height: 36
+raymap_width: 48
+fps: 10
+num_samples: 64
+subset_id: tartanair   # selects the diffusion-forcing settings in algorithm.diffusion_forcing.subset_settings
+max_text_tokens: 512
+load_prompt_embed: true
+load_video_latent: false

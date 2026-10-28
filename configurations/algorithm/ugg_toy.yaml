@@ -1,0 +1,8 @@
+# The release model truncated to its first 2 transformer blocks: same code paths, a fraction
+# of the memory and time. For debugging and smoke tests only (outputs are meaningless).
+defaults:
+  - ugg
+  - _self_
+
+model:
+  debug_num_layers: 2

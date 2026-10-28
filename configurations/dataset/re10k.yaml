@@ -1,0 +1,47 @@
+defaults:
+  - video_base
+  - _self_
+
+data_root: ${data_dir}/re10k
+metadata_path: ""  # RE10K loads from directory structure, not a metadata csv
+load_prompt_embed: true
+load_video_latent: false
+trim_mode: random_cut
+pad_mode: slowdown
+# max_mean_adj_rotation_deg: 3.5
+fps: 8      # calibrated (tune_fps @ 50 samples; pivot)
+n_frames: 50
+test_percentage: 0.01
+height: 240
+width: 320
+raymap_height: 30   # height // vae_stride (240 // 8)
+raymap_width: 40    # width  // vae_stride (320 // 8)
+
+# Confirmed unreadable with the training Decord path. Keeping this list in the
+# resolved config makes exclusion deterministic on every rank and auditable in
+# saved run configs, including when records use a cached manifest.
+invalid_video_ids:
+  - "UPOZrpkWD1U"
+  - "Gp-WUXakD_Y"
+  - "ll4HbFTbn2E"
+  - "tOjJ2BhKCnw"
+  - "v5uVslokSfs"
+  - "kJ0iFFd4Byo"
+  - "SR0XA_5u4oI"
+  - "5sdwU514wdc"
+  - "hiOS06plNYY"
+
+min_camera_travel: 0.0  # skip clips with total camera path length below this (0 = disabled)
+# min_camera_travel: 0.0  # skip clips with total camera path length below this (0 = disabled)
+
+filtering:
+  disable: true  # RE10K dataset handles its own filtering
+
+augmentation:
+  random_flip: null
+  ratio: null
+  scale: null
+
+# records-manifest cache (video_base._load_records_cached): first run walks + writes
+# the JSON to the central manifest dir; every later startup loads it instantly.
+records_manifest: _records_manifest.json
