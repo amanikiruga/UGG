@@ -1,13 +1,14 @@
 """Command-line inference for the six UGG tasks (sample inputs in assets/).
 
-    python infer.py task=video      input=assets/bonn_balloon2.mp4
-    python infer.py task=video      input=assets/bonn_balloon2.mp4 mode=sparse
-    python infer.py task=image      input=assets/bonn_balloon2_first.png cameras=assets/bonn_balloon2_geometry.npz
-    python infer.py task=first_last input=assets/bonn_balloon2_first.png last=assets/bonn_balloon2_last.png \
-                                    cameras=assets/bonn_balloon2_geometry.npz
-    python infer.py task=text       prompt="a person walks through an office holding balloons"
-    python infer.py task=camera     cameras=assets/bonn_balloon2_geometry.npz prompt="an office"
-    python infer.py task=depth      depth=assets/bonn_balloon2_geometry.npz
+    python infer.py task=video      input=assets/bonn_balloon2/frames.mp4
+    python infer.py task=video      input=assets/bonn_balloon2/frames.mp4 mode=sparse
+    python infer.py task=image      input=assets/re10k_staircase/first.png cameras=assets/re10k_staircase/cameras.npz
+    python infer.py task=first_last input=assets/re10k_bedroom/first.png last=assets/re10k_bedroom/last.png \
+                                    cameras=assets/re10k_bedroom/cameras.npz
+    python infer.py task=text       prompt="The camera glides forward down a long marble corridor..." algorithm.lang_guidance=5
+    python infer.py task=camera     cameras=assets/dl3dv_gallery/cameras.npz algorithm.hist_guidance=2
+    python infer.py task=depth      depth=assets/dl3dv_treatment_room/depth.npz algorithm.hist_guidance=2 \
+                                    input=assets/dl3dv_treatment_room/first.png last=assets/dl3dv_treatment_room/last.png
 
 Writes rgb.mp4, depth.mp4, depth{,_norm}.npy, c2w.npy, intrinsics.npy and meta.json to
 `output_dir`. All defaults: configurations/inference.yaml and configurations/algorithm/ugg.yaml.
@@ -50,8 +51,9 @@ def main(cfg: DictConfig) -> None:
         pred = model.text_to_4d(cfg.prompt, num_frames=cfg.num_frames)
     elif cfg.task == "camera":
         pred = model.camera_to_4d(cams)
-    else:
-        pred = model.depth_to_4d(_depth(cfg.depth))
+    else:  # optional anchors: input= (first frame) and last= (last frame)
+        anchors = [x for x in (cfg.input, cfg.last) if x]
+        pred = model.depth_to_4d(_depth(cfg.depth), images=anchors or None)
     out = pred.save(cfg.output_dir, fps=cfg.dataset.fps)
     print(f"saved {len(pred.rgb)} frames ({cfg.task}; given: {', '.join(pred.meta['conditioned'])}) to {out}")
 

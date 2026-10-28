@@ -19,7 +19,8 @@ sys.path.insert(0, str(ROOT))
 from ugg import UGG  # noqa: E402
 
 A = ROOT / "assets"
-VIDEO, FIRST, LAST = A / "bonn_balloon2.mp4", A / "bonn_balloon2_first.png", A / "bonn_balloon2_last.png"
+VIDEO = A / "bonn_balloon2" / "frames.mp4"
+FIRST, LAST = A / "re10k_bedroom" / "first.png", A / "re10k_bedroom" / "last.png"
 M = 10  # frames per test clip
 
 
@@ -34,15 +35,16 @@ def check(pred, m=M, H=288, W=384):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=None)
+    ap.add_argument("--ckpt", default=None, help="checkpoint path (default: the release checkpoint)")
     args = ap.parse_args()
     out = Path(args.out or tempfile.mkdtemp())
-    geo = np.load(A / "bonn_balloon2_geometry.npz")
+    geo = np.load(A / "re10k_bedroom" / "cameras.npz")
     cams = (geo["c2w"][:M], geo["intrinsics"][:M])
-    depth = geo["depth"][:M].astype(np.float32)
+    depth = np.load(A / "dl3dv_treatment_room" / "depth.npz")["depth"][:M].astype(np.float32)
     kw = dict(sample_steps=4, seed=0)
 
     t = time.time()
-    model = UGG.from_pretrained()
+    model = UGG.from_pretrained(ckpt=sys.argv[sys.argv.index('--ckpt') + 1] if '--ckpt' in sys.argv else None)
     print(f"load {time.time() - t:.0f}s")
 
     # 1. video -> 4D (dense) and the sparse protocol
@@ -87,7 +89,10 @@ def main():
     # 6. depth only -> 4D; the given depth comes back out (up to scale)
     p = model.depth_to_4d(depth, **kw)
     check(p)
-    corr = np.corrcoef(np.log(p.depth.ravel()), np.log(depth.ravel()))[0, 1]
+    v = depth > 0
+    corr = np.corrcoef(np.log(p.depth[v]), np.log(depth[v]))[0, 1]
+    room = A / "dl3dv_treatment_room"
+    check(model.depth_to_4d(depth, images=[room / "first.png", room / "last.png"], **kw))
     assert corr > 0.9, f"conditioned depth not reproduced (log-depth corr {corr:.2f})"
     print(f"depth->4D ok (log-depth corr {corr:.3f})")
 

@@ -153,10 +153,13 @@ class UGG:
         always paired rays with at least the first RGB frame."""
         return self.generate(cameras=cameras, **kw)
 
-    def depth_to_4d(self, depth, **kw) -> Prediction:
-        """Depth maps only (+ optional prompt) -> video + cameras. Zero-shot: training always
-        paired depth with the first RGB frame."""
-        return self.generate(depth=depth, **kw)
+    def depth_to_4d(self, depth, images=None, **kw) -> Prediction:
+        """Depth maps (+ optional prompt) -> video + cameras.
+
+        Depth alone is zero-shot (training always paired depth with the first RGB frame) and
+        drifts after ~17 frames; pass images=[first] or [first, last] to anchor the clip,
+        which is the trained pattern and gives the cleanest results."""
+        return self.generate(depth=depth, images=images, **kw)
 
     def __call__(self, video, mode: Optional[str] = None, **kw) -> Prediction:
         """Reconstruction shortcut: mode="dense" (all frames observed) or "sparse" (first + last
@@ -174,6 +177,7 @@ class UGG:
                  prompt: Optional[str] = None, num_frames: Optional[int] = None,
                  seed: Optional[int] = None, sample_steps: Optional[int] = None,
                  hist_guidance: Optional[float] = None, text_guidance: Optional[float] = None,
+                 sample_shift: Optional[float] = None,
                  shared_intrinsics: Optional[bool] = None, percentile_clip=_UNSET,
                  max_frames: Optional[int] = None, frame_mode: Optional[str] = None) -> Prediction:
         """Condition on any mix of RGB frames, cameras, depth and text; generate the rest.
@@ -196,6 +200,7 @@ class UGG:
         model.sample_steps = algo.sample_steps if sample_steps is None else sample_steps
         model.hist_guidance = algo.hist_guidance if hist_guidance is None else hist_guidance
         model.lang_guidance = algo.lang_guidance if text_guidance is None else text_guidance
+        model.sample_shift = algo.sample_shift if sample_shift is None else sample_shift
         shared_intrinsics = cfg.shared_intrinsics if shared_intrinsics is None else shared_intrinsics
         percentile_clip = cfg.percentile_clip if percentile_clip is _UNSET else percentile_clip
         max_frames = max_frames or cfg.max_frames
@@ -289,7 +294,7 @@ class UGG:
             meta=dict(conditioned=conditioned, observe=observe if given_rgb else "none",
                       prompt=prompt, seed=seed, sample_steps=model.sample_steps,
                       hist_guidance=model.hist_guidance, text_guidance=model.lang_guidance,
-                      shared_intrinsics=shared_intrinsics, percentile_clip=percentile_clip,
+                      sample_shift=model.sample_shift, shared_intrinsics=shared_intrinsics, percentile_clip=percentile_clip,
                       ckpt=algo.model.tuned_ckpt_path, height=H, width=W),
         )
 

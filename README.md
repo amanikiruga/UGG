@@ -22,7 +22,7 @@ and the training loop in `experiments/`, all launched by `main.py`.
 ```
 UGG/
 ├── ugg/                  inference API: UGG.from_pretrained(), the six tasks, camera + depth coding, video IO
-├── assets/               sample clip (Bonn balloon2) + cameras/depth for it
+├── assets/               sample scenes for every task (Bonn, RE10K, DL3DV) + text prompts
 ├── infer.py              command-line inference (Hydra)
 ├── main.py               training entry point (Hydra + Lightning), as in LVP
 ├── algorithms/wan/       the model (wan_t2v_ray_depth_mot_concat_5b.py) and Wan modules
@@ -95,9 +95,36 @@ takes any combination directly.
 
 ### Sample inputs
 
-`assets/` holds a 50-frame clip from the Bonn RGB-D Dynamic dataset (`rgbd_bonn_balloon2`), its
-first and last frames, and `bonn_balloon2_geometry.npz` with cameras (`c2w`, `intrinsics` at
-288×384) and depth for the same frames, estimated by UGG from the video, for the camera and depth tasks.
+`assets/` holds one scene per task, picked because they work well:
+
+| folder | source | contents | use it for |
+|---|---|---|---|
+| `bonn_balloon2/` | Bonn RGB-D Dynamic | `frames.mp4` (50 frames) | video → 4D |
+| `re10k_staircase/` | RealEstate10K test | `first.png`, `last.png`, `cameras.npz`, `frames.mp4` | image + cameras → 4D |
+| `re10k_bedroom/` | RealEstate10K test | same | first/last + cameras → 4D |
+| `dl3dv_gallery/` | DL3DV-10K test | same + `caption.txt` | camera → 4D; image / first-last + cameras → 4D |
+| `dl3dv_treatment_room/` | DL3DV-10K test | same + `caption.txt`, `depth.npz` (metric, 0 = invalid) | depth → 4D |
+| `text_prompts.json` | | indoor camera-motion captions | text → 4D |
+
+`cameras.npz` stores the dataset's ground-truth cameras: `c2w` (T, 4, 4) is OpenCV
+camera-to-world with the first camera at the origin, and `intrinsics` (T, 3, 3) is in pixels of
+the 288×384 model input. `frames.mp4` is the real clip, for comparing against what the model
+generates. `caption.txt` is the dataset's caption of the clip.
+
+**Captions matter most when little is given.** For camera- and depth-conditioned generation the
+caption is the only appearance cue: without it, camera → 4D invents an unrelated scene and depth
+→ 4D comes out dark and colourless. With frames given, a caption changes little (RE10K bedroom:
+27.4 vs 27.2 dB). A caption that does not describe the clip actively hurts. RE10K captions
+describe the whole video, so the staircase clip's caption, which describes the house exterior,
+turns the indoor shot into a garden. Leave `prompt` empty unless you have a caption for the
+clip itself.
+
+**Generation varies with the seed.** On the staircase, image + cameras scores 18–25 dB PSNR
+across seeds 0–2 and 213. Try a few seeds for generation tasks; reconstruction (video → 4D)
+varies far less.
+
+`python scripts/run_examples.py` runs every example below with its recommended settings and
+writes them to `outputs/examples/`.
 
 ### Python
 
@@ -106,15 +133,29 @@ import numpy as np
 from ugg import UGG
 
 model = UGG.from_pretrained()                      # release weights + protocol defaults
-geo = np.load("assets/bonn_balloon2_geometry.npz")
-cams = (geo["c2w"], geo["intrinsics"])             # c2w (T,4,4) OpenCV, K (3,3) or (T,3,3) at 288x384
+cams = lambda s: tuple(np.load(f"assets/{s}/cameras.npz")[k] for k in ("c2w", "intrinsics"))
 
-pred = model.video_to_4d("assets/bonn_balloon2.mp4")
-pred = model.image_to_4d("assets/bonn_balloon2_first.png", cameras=cams)
-pred = model.first_last_to_4d("assets/bonn_balloon2_first.png", "assets/bonn_balloon2_last.png", cameras=cams)
-pred = model.text_to_4d("a person walks through an office holding balloons", num_frames=50)
-pred = model.camera_to_4d(cams, prompt="an office")
-pred = model.depth_to_4d(geo["depth"])
+# video -> 4D
+pred = model.video_to_4d("assets/bonn_balloon2/frames.mp4")
+# image + cameras -> 4D
+pred = model.image_to_4d("assets/re10k_staircase/first.png", cameras=cams("re10k_staircase"),
+                         hist_guidance=1.5, sample_shift=0.9, seed=2)
+# first + last image + cameras -> 4D
+pred = model.first_last_to_4d("assets/re10k_bedroom/first.png", "assets/re10k_bedroom/last.png",
+                              cameras=cams("re10k_bedroom"), hist_guidance=1.5, sample_shift=0.7,
+                              sample_steps=60, seed=97)
+# text -> 4D
+pred = model.text_to_4d("The camera glides forward down a long marble corridor, past a colonnade of pale "
+                        "stone arches that recede into soft daylight. Tall windows cast long rectangles of "
+                        "light across the polished floor, and a vaulted ceiling curves overhead.",
+                        num_frames=50, text_guidance=5.0, seed=11)
+caption = lambda s: open(f"assets/{s}/caption.txt").read().strip()
+# camera trajectory -> 4D (the caption supplies the appearance)
+pred = model.camera_to_4d(cams("dl3dv_gallery"), prompt=caption("dl3dv_gallery"), hist_guidance=2.0, seed=29)
+# depth -> 4D (anchored on the first and last frame: the trained pattern; drop images= for depth alone)
+depth = np.load("assets/dl3dv_treatment_room/depth.npz")["depth"].astype(np.float32)
+pred = model.depth_to_4d(depth, images=["assets/dl3dv_treatment_room/first.png", "assets/dl3dv_treatment_room/last.png"],
+                         prompt=caption("dl3dv_treatment_room"), hist_guidance=2.0, seed=59)
 
 pred.rgb            # (T, H, W, 3) uint8
 pred.depth          # (T, H, W) relative depth (up to scale)
@@ -124,28 +165,38 @@ pred.intrinsics     # (T, 3, 3)
 pred.save("out/")   # rgb.mp4, depth.mp4, *.npy, meta.json
 ```
 
-Any call takes `seed`, `sample_steps`, `hist_guidance`, `text_guidance`, `prompt`,
-`shared_intrinsics`, `percentile_clip` and `max_frames`. Unset arguments take the config
-defaults. Cameras from one prediction can drive another (`cameras=pred`). To change defaults
-once, pass Hydra overrides:
+Any call takes `seed`, `sample_steps`, `sample_shift`, `hist_guidance`, `text_guidance`,
+`prompt`, `shared_intrinsics`, `percentile_clip` and `max_frames`; unset arguments take the
+config defaults. The values above are the ones that worked best per task. Generation tasks
+like more history guidance (1.5–2) than reconstruction (1.0), and text needs strong text
+guidance (5). Cameras from one prediction can drive another (`cameras=pred`). To change
+defaults once, pass Hydra overrides:
 
 ```python
 model = UGG.from_pretrained(overrides=["algorithm.sample_steps=20", "seed=42", "percentile_clip=10"])
 model = UGG.from_pretrained(ckpt="/path/to/other.ckpt")
 ```
 
+Loading reads the 30 GB checkpoint. On a network filesystem, copying it to local disk or
+`/dev/shm` first and passing `ckpt=` makes loading several times faster.
+
 ### Command line
 
 ```bash
-python infer.py task=video      input=assets/bonn_balloon2.mp4 output_dir=out/video
-python infer.py task=video      input=assets/bonn_balloon2.mp4 mode=sparse seed=1
-python infer.py task=image      input=assets/bonn_balloon2_first.png cameras=assets/bonn_balloon2_geometry.npz
-python infer.py task=first_last input=assets/bonn_balloon2_first.png last=assets/bonn_balloon2_last.png \
-                                cameras=assets/bonn_balloon2_geometry.npz
-python infer.py task=text       prompt="a person walks through an office holding balloons" algorithm.lang_guidance=2.0
-python infer.py task=camera     cameras=assets/bonn_balloon2_geometry.npz prompt="an office"
-python infer.py task=depth      depth=assets/bonn_balloon2_geometry.npz
-python infer.py task=video      input=my_clip.mp4 algorithm.sample_steps=20 algorithm.hist_guidance=2.0
+python infer.py task=video      input=assets/bonn_balloon2/frames.mp4 output_dir=out/video
+python infer.py task=video      input=assets/bonn_balloon2/frames.mp4 mode=sparse seed=1
+python infer.py task=image      input=assets/re10k_staircase/first.png cameras=assets/re10k_staircase/cameras.npz \
+                                algorithm.hist_guidance=1.5 algorithm.sample_shift=0.9 seed=2
+python infer.py task=first_last input=assets/re10k_bedroom/first.png last=assets/re10k_bedroom/last.png \
+                                cameras=assets/re10k_bedroom/cameras.npz algorithm.hist_guidance=1.5 \
+                                algorithm.sample_shift=0.7 algorithm.sample_steps=60 seed=97
+python infer.py task=text       prompt="The camera glides forward down a long marble corridor ..." \
+                                algorithm.lang_guidance=5 seed=11
+python infer.py task=camera     cameras=assets/dl3dv_gallery/cameras.npz algorithm.hist_guidance=2 seed=29 \
+                                prompt="$(cat assets/dl3dv_gallery/caption.txt)"
+python infer.py task=depth      depth=assets/dl3dv_treatment_room/depth.npz algorithm.hist_guidance=2 seed=59 \
+                                prompt="$(cat assets/dl3dv_treatment_room/caption.txt)" \
+                                input=assets/dl3dv_treatment_room/first.png last=assets/dl3dv_treatment_room/last.png   # optional anchors
 ```
 
 ### Defaults and what they mean
@@ -252,5 +303,5 @@ This repo is forked from [Boyuan Chen](https://boyuan.space/)'s research templat
 [repo](https://github.com/buoyancy99/research-template). By its MIT license, you must keep the
 above sentence in `README.md` and the `LICENSE` file to credit the author. The model code builds on
 [Wan2.2](https://github.com/Wan-Video/Wan2.2) and follows the layout of
-[Large Video Planner](https://github.com/buoyancy99/large-video-planner). The sample clip in
-`assets/` is from the Bonn RGB-D Dynamic dataset.
+[Large Video Planner](https://github.com/buoyancy99/large-video-planner). The sample scenes in
+`assets/` come from the Bonn RGB-D Dynamic, RealEstate10K and DL3DV-10K datasets.

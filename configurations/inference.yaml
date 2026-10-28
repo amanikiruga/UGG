@@ -10,8 +10,8 @@ defaults:
 debug: false
 
 task: video              # video | image | first_last | text | camera | depth   (what is given; see README)
-input: null              # video / image folder (video), image (image, first_last), unused otherwise
-last: null               # last image (first_last)
+input: null              # video / image folder (video), first image (image, first_last; optional anchor for depth)
+last: null               # last image (first_last; optional anchor for depth)
 cameras: null            # .npz with c2w (T,4,4) + intrinsics (3,3 | T,3,3) at 288x384 (image, first_last, camera)
 depth: null              # .npz / .npy with depth (T,H,W) (depth)
 num_frames: 50           # clip length when no video gives it (image without cameras, text)

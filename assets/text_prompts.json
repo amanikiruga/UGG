@@ -1,0 +1,30 @@
+{
+ "note": "Text-to-4D prompts. The first one produced the demo result (seed 11, text_guidance 5); the rest are untested starting points in the same style.",
+ "prompts": [
+  "The camera glides forward down a long marble corridor, past a colonnade of pale stone arches that recede into soft daylight. Tall windows cast long rectangles of light across the polished floor, and a vaulted ceiling curves overhead.",
+  "The camera ascends a wide spiral staircase of dark timber, the banister curling away beneath it. Warm light falls from a skylight far above, and landings open onto quiet panelled hallways.",
+  "The camera moves forward through a grand museum gallery, polished parquet underfoot and tall gilt-framed paintings receding along both walls toward a bright archway at the far end.",
+  "The camera glides through a modern library atrium, past balconies of bookshelves stacked four storeys high. Pale daylight falls from a glass roof onto long reading tables below.",
+  "The camera drifts down a narrow hotel corridor lined with numbered doors, a patterned runner stretching into the distance beneath evenly spaced wall sconces.",
+  "The camera moves slowly across a spacious loft apartment, exposed brick on one side and tall industrial windows on the other, a long wooden table receding toward the light.",
+  "The camera travels forward through an underground station concourse, white tiled walls curving overhead and steel columns marching away toward a distant lit platform.",
+  "The camera glides through a sunlit conservatory of iron and glass, the arched frame overhead throwing a lattice of shadows across a stone floor that recedes into brightness.",
+  "The camera drifts through a quiet art gallery of white walls and polished concrete, sparse canvases receding along a long sightline toward a doorway filled with daylight.",
+  "The camera moves forward along a timber-framed attic passage, sloping rafters converging overhead and dormer windows casting pools of light onto bare floorboards.",
+  "The camera glides into a grand entrance hall, a sweeping staircase rising on the right, chequered marble underfoot, and a tall mirror reflecting the depth of the room.",
+  "The camera drifts through a vaulted stone wine cellar, barrel arches receding in a long row, lamps glowing in iron brackets along the rough masonry walls.",
+  "The camera glides down a long hospital corridor, pale linoleum stretching ahead, recessed ceiling lights repeating into the distance past identical closed doors.",
+  "The camera moves slowly through a panelled study, floor-to-ceiling bookshelves on both sides, a desk and reading lamp in the middle distance beneath a tall window.",
+  "The camera drifts through a minimalist concrete apartment, a long hallway opening into a bright living space, light raking across bare walls toward a floor-to-ceiling window.",
+  "The camera glides forward through a bright cathedral nave, pale stone piers rising on both sides into a ribbed vault. Tall clerestory windows flood the aisle with daylight and rows of wooden pews recede toward a sunlit altar.",
+  "The camera moves forward along a white museum corridor, skylights overhead washing the walls with even daylight, framed canvases repeating down both sides toward a bright far doorway.",
+  "The camera travels down a long colonnaded cloister, round arches opening onto a sunlit courtyard on one side, the vaulted walkway stretching far ahead over worn flagstones.",
+  "The camera glides through a bright subway concourse, white tiled walls curving overhead, steel columns repeating down the platform toward daylight at the far stair.",
+  "The camera moves forward through a sunlit greenhouse corridor, a long iron-and-glass vault overhead casting a bright lattice across the tiled floor as the structure recedes into light.",
+  "The camera drifts forward through a grand hotel lobby, a coffered ceiling overhead and marble columns marching toward a bright reception wall, daylight pouring from tall windows on the left.",
+  "The camera glides up a wide stone staircase between carved balustrades, daylight falling from a large arched window on the landing above, the steps receding upward in clean perspective.",
+  "The camera moves forward through a bright modern airport terminal, a white ribbed ceiling curving overhead and a glass wall on the right flooding the polished floor with daylight.",
+  "The camera travels through a long vaulted brick wine cellar, warm lamps repeating along the arcade, barrel arches receding evenly into the distance over a stone floor.",
+  "The camera glides forward through a bright university library hall, two storeys of bookshelves on both sides, daylight from a glazed roof falling across long reading tables."
+ ]
+}
