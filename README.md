@@ -47,11 +47,13 @@ UGG/
 
 The release path is set in [configurations/algorithm/ugg.yaml](configurations/algorithm/ugg.yaml)
 (`model.tuned_ckpt_path`); override it with `algorithm.model.tuned_ckpt_path=...` (a local
-`.safetensors`/`.ckpt` file or `<user>/<repo>/<file>` on the Hub). To fetch everything ahead of time:
+`.safetensors`/`.ckpt` file or `<user>/<repo>/<file>` on the Hub). After installing the environment
+below and setting `HF_HOME` to your data volume, fetch everything ahead of time:
 
 ```bash
-huggingface-cli download amanim71/UGG ugg_release.safetensors
-huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --include "config.json" "Wan2.2_VAE.pth" "models_t5_umt5-xxl-enc-bf16.pth" "google/*"
+hf download amanim71/UGG ugg_release.safetensors
+hf download Wan-AI/Wan2.2-TI2V-5B --include "config.json" --include "Wan2.2_VAE.pth" --include "models_t5_umt5-xxl-enc-bf16.pth" --include "google/*"
+python -c 'from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("google/umt5-xxl")'
 ```
 
 # Environment setup
@@ -62,6 +64,9 @@ pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorc
 pip install -r requirements.txt
 pip install flash-attn==2.7.4.post1 --no-build-isolation     # optional; FA3 is picked up if importable
 ```
+
+FlashAttention needs a compatible CUDA development toolkit (`nvcc`) to build. Without it,
+the model uses PyTorch's native scaled dot-product attention.
 
 ```bash
 export HF_HOME=/path/to/hf_cache   # where the Wan2.2 files are cached
@@ -191,12 +196,12 @@ python infer.py task=image      input=assets/re10k_staircase/first.png cameras=a
 python infer.py task=first_last input=assets/re10k_bedroom/first.png last=assets/re10k_bedroom/last.png \
                                 cameras=assets/re10k_bedroom/cameras.npz algorithm.hist_guidance=1.5 \
                                 algorithm.sample_shift=0.7 algorithm.sample_steps=60 seed=97
-python infer.py task=text       prompt="The camera glides forward down a long marble corridor ..." \
+python infer.py task=text       'prompt="The camera glides forward down a long marble corridor ..."' \
                                 algorithm.lang_guidance=5 seed=11
 python infer.py task=camera     cameras=assets/dl3dv_gallery/cameras.npz algorithm.hist_guidance=2 seed=29 \
-                                prompt="$(cat assets/dl3dv_gallery/caption.txt)"
+                                prompt="'$(cat assets/dl3dv_gallery/caption.txt)'"
 python infer.py task=depth      depth=assets/dl3dv_treatment_room/depth.npz algorithm.hist_guidance=2 seed=59 \
-                                prompt="$(cat assets/dl3dv_treatment_room/caption.txt)" \
+                                prompt="'$(cat assets/dl3dv_treatment_room/caption.txt)'" \
                                 input=assets/dl3dv_treatment_room/first.png last=assets/dl3dv_treatment_room/last.png   # optional anchors
 ```
 

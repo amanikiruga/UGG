@@ -84,6 +84,35 @@ def test_depth_decode():
     assert np.all(np.diff(d0.ravel()) < 0)
 
 
+def test_sdpa_fallback_masks_and_gradients():
+    from algorithms.wan.modules.attention import _sdpa_attention
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 4, 2, 8, requires_grad=True)
+    k = torch.randn(2, 6, 2, 8, requires_grad=True)
+    v = torch.randn(2, 6, 2, 8, requires_grad=True)
+    q_lens, k_lens = [4, 3], [6, 5]
+    for causal, window in ((False, (-1, -1)), (True, (-1, -1)), (False, (1, 2))):
+        out = _sdpa_attention(q, k, v, q_lens, k_lens, softmax_scale=0.4,
+                              q_scale=0.7, causal=causal, window_size=window,
+                              dtype=torch.float32)
+        for i, (nq, nk) in enumerate(zip(q_lens, k_lens)):
+            qi, ki, vi = [x[i, :n].transpose(0, 1)
+                          for x, n in ((q, nq), (k, nk), (v, nk))]
+            scores = (qi * 0.7) @ ki.transpose(-2, -1) * 0.4
+            for row in range(nq):
+                for col in range(nk):
+                    offset = col - (row + nk - nq)
+                    if (causal and offset > 0) or (window[0] >= 0 and offset < -window[0]) \
+                            or (window[1] >= 0 and offset > window[1]):
+                        scores[:, row, col] = -torch.inf
+            expected = (scores.softmax(-1) @ vi).transpose(0, 1)
+            torch.testing.assert_close(out[i, :nq], expected)
+            assert not out[i, nq:].any()
+        out.sum().backward()
+        assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q, k, v))
+
+
 def _raymap(K, c2w, H, W):
     v, u = np.meshgrid(np.arange(H) + 0.5, np.arange(W) + 0.5, indexing="ij")
     pix = np.stack([u, v, np.ones_like(u)], -1) @ np.linalg.inv(K).T

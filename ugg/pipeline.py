@@ -68,15 +68,15 @@ class Prediction:
             np.save(out / f"{k}.npy", getattr(self, k))
         with open(out / "meta.json", "w") as f:
             json.dump(self.meta, f, indent=2)
-        iio.imwrite(out / "rgb.mp4", self.rgb, fps=fps)
+        iio.imwrite(out / "rgb.mp4", self.rgb, plugin="pyav", codec="libx264", fps=fps)
         disp = (self.depth_norm + 1) / 2
         lo, hi = np.percentile(disp, [2, 98])
         cmap = matplotlib.colormaps["Spectral_r"]
         vis = (cmap(np.clip((disp - lo) / max(hi - lo, 1e-6), 0, 1))[..., :3] * 255).astype(np.uint8)
-        iio.imwrite(out / "depth.mp4", vis, fps=fps)
+        iio.imwrite(out / "depth.mp4", vis, plugin="pyav", codec="libx264", fps=fps)
         from .camviz import render_cameras
         cams = np.stack([np.asarray(f) for f in render_cameras(self.c2w, 640, 480)])
-        iio.imwrite(out / "cameras.mp4", cams, fps=fps)
+        iio.imwrite(out / "cameras.mp4", cams, plugin="pyav", codec="libx264", fps=fps)
         return out
 
 

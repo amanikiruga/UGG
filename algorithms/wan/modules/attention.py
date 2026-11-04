@@ -21,6 +21,39 @@ __all__ = [
 ]
 
 
+def _sdpa_attention(q, k, v, q_lens=None, k_lens=None, dropout_p=0.,
+                    softmax_scale=None, q_scale=None, causal=False,
+                    window_size=(-1, -1), dtype=torch.bfloat16):
+    """Native PyTorch fallback; slice padding before attending to each sample."""
+    outputs = []
+    compute_dtype = v.dtype if v.dtype in (torch.float16, torch.bfloat16) else dtype
+    for i in range(q.size(0)):
+        nq = int(q_lens[i]) if q_lens is not None else q.size(1)
+        nk = int(k_lens[i]) if k_lens is not None else k.size(1)
+        qi, ki, vi = [x[i, :length].transpose(0, 1).unsqueeze(0).to(compute_dtype)
+                      for x, length in ((q, nq), (k, nk), (v, nk))]
+        if q_scale is not None:
+            qi = qi * q_scale
+        mask = None
+        if causal or tuple(window_size) != (-1, -1):
+            # FlashAttention aligns causal/window masks to the bottom right.
+            center = torch.arange(nq, device=q.device)[:, None] + nk - nq
+            keys = torch.arange(nk, device=q.device)[None, :]
+            mask = torch.ones((nq, nk), device=q.device, dtype=torch.bool)
+            if causal:
+                mask &= keys <= center
+            if window_size[0] >= 0:
+                mask &= keys >= center - window_size[0]
+            if window_size[1] >= 0:
+                mask &= keys <= center + window_size[1]
+        out = torch.nn.functional.scaled_dot_product_attention(
+            qi, ki, vi, attn_mask=mask, dropout_p=dropout_p, scale=softmax_scale,
+            enable_gqa=q.size(2) != k.size(2))
+        out = out.squeeze(0).transpose(0, 1)
+        outputs.append(torch.nn.functional.pad(out, (0, 0, 0, 0, 0, q.size(1) - nq)))
+    return torch.stack(outputs).to(q.dtype)
+
+
 def flash_attention(
     q,
     k,
@@ -52,6 +85,11 @@ def flash_attention(
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
+
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        warnings.warn('FlashAttention is unavailable; using PyTorch scaled_dot_product_attention.')
+        return _sdpa_attention(q, k, v, q_lens, k_lens, dropout_p,
+                               softmax_scale, q_scale, causal, window_size, dtype)
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
@@ -166,18 +204,5 @@ def attention(
             version=fa_version,
         )
     else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
-
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out
+        return _sdpa_attention(q, k, v, q_lens, k_lens, dropout_p,
+                               softmax_scale, q_scale, causal, window_size, dtype)
