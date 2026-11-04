@@ -1,12 +1,6 @@
-"""Canonical definition of the FG depth expert -- ONE source of truth.
+"""Which parameters belong to the depth expert -- the single definition used by the trainer.
 
-Both consumers import from here so they can never disagree:
-  * scripts/splice_fg_checkpoint.py  -- which tensors come from G
-  * the training algorithm            -- which tensors stay trainable when the rest is frozen
-
-A disagreement between those two would be silent and severe: a tensor spliced from G but
-left frozen would never adapt, and a tensor kept from F but left trainable would drift the
-"frozen" branches. Hence one module.
+`gf_freeze_depth` freezes exactly the tensors classified here as depth-expert tensors.
 
 Layout of the MoT-concat 5B (algorithms/wan/modules/model_ray_depth_mot_concat_5b.py):
 per-modality weights live in ModuleList(3) slots [0]=rgb, [1]=ray, [2]=depth, over a single
@@ -60,13 +54,13 @@ def is_partial_modality(name: str) -> bool:
 
 
 def must_stay(name: str) -> bool:
-    """True for a tensor that must remain F's under every circumstance."""
+    """True for a shared tensor that is never classified as depth-expert."""
     return any(p.match(name) for p in _STAY)
 
 
 def is_trainable_under_fg(name: str) -> bool:
-    """FG freezes rgb/ray/pose and trains the depth expert (plus the shared modality
-    embedding, whose non-depth slots receive no gradient)."""
+    """The inverse recipe: freeze rgb/ray/pose and train the depth expert (plus the shared
+    modality embedding, whose non-depth slots receive no gradient)."""
     return is_depth_expert(name) or is_partial_modality(name)
 
 
@@ -85,26 +79,14 @@ def expected_depth_key_count(num_blocks: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# GF (the inverse of FG): freeze the DEPTH expert, train rgb/ray/pose.
+# GF: freeze the depth expert, train rgb/ray/pose (the release recipe, gf_freeze_depth).
 #
-# Motivation (2026-09-12): eff-2500 has the best depth we have measured
-# (bonn 0.059745 / kitti 0.083316 / sintel 0.367010) but weak NVS (23.068),
-# while F has the best NVS (24.5393) and worse depth. Splicing eff-2500's depth
-# expert into F FAILED outright (NVS 21.6978, bonn 0.084365, kitti 0.123652 --
-# worse than BOTH parents), because the transplanted expert had never co-adapted
-# to F's joint attention. So instead of moving weights, start FROM eff-2500 and
-# move the rgb/ray side by gradient descent, holding depth fixed.
+# Freezing the depth expert does not make depth invariant: self-attention is unmasked over
+# [rgb | ray | depth], so depth tokens read rgb/ray keys/values and the depth outputs still
+# shift as rgb/ray adapt. Evaluate depth on every checkpoint.
 #
-# SYMMETRIC CAVEAT to the one in the FG hook: freezing the depth expert does NOT
-# make depth invariant. Self-attention is unmasked over [rgb | ray | depth], so
-# the depth tokens read rgb/ray k/v and depth OUTPUTS drift as rgb/ray adapts.
-# This bounds the drift; it does not remove it. Depth must be re-measured on
-# every checkpoint, and the run stopped when it regresses past tolerance.
-#
-# The shared modality embedding (self_attn.ray_embedding, slots [0]=rgb [1]=ray
-# [2]=depth) stays TRAINABLE here: its rgb/ray slices are exactly what we want to
-# move, and slot [2] receives gradient only from depth tokens. If that turns out
-# to matter, zero its [2] grad in an optimizer hook rather than freezing the tensor.
+# The shared modality embedding (self_attn.ray_embedding, slots [0]=rgb [1]=ray [2]=depth)
+# stays trainable; slot [2] receives gradient only from depth tokens.
 # ---------------------------------------------------------------------------
 
 def is_trainable_under_gf(name: str) -> bool:

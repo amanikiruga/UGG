@@ -102,7 +102,7 @@ def main():
     except ValueError:
         pass
     a.save(out / "video")
-    assert all((out / "video" / f).exists() for f in ("rgb.mp4", "depth.mp4", "depth.npy", "c2w.npy", "meta.json"))
+    assert all((out / "video" / f).exists() for f in ("rgb.mp4", "depth.mp4", "cameras.mp4", "depth.npy", "c2w.npy", "meta.json"))
     print(f"save ok -> {out}")
     print("GPU SMOKE PASS")
 

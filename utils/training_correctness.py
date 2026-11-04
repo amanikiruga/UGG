@@ -67,9 +67,8 @@ def masked_flow_mse(
 ):
     """Compute the branch's per-sample flow MSE with global normalization.
 
-    When H011 is enabled, exact-clean frames (timestep zero) are removed before
-    each sample's frame mean. The final mean remains per valid sample, matching
-    `clean-training-code-aug-4`; only its cross-rank denominator is corrected.
+    With mask_clean, exact-clean frames (timestep zero) are removed before each sample's
+    frame mean. The final mean is per valid sample, normalized across ranks.
     """
     if pred.shape != target.shape or pred.ndim != 5:
         raise ValueError(

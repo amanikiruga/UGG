@@ -7,9 +7,7 @@ Layout (per climate under <data_root>/MidAir/{Kite_training,PLE_training}/<clima
     color_left/trajectory_XXXX/NNNNNN.JPEG   1024x1024 RGB, 25 fps
     depth/trajectory_XXXX/NNNNNN.PNG         uint16 container of float16 metres
 
-Geometry (verified by datasets/geometry_verification/mid_air/check_raw_reproj.py:
-median rel depth reprojection error 0.12% at 4- and 16-frame baselines; wrong
-hypotheses 2-5%):
+Geometry:
 - Intrinsics FIXED: 1024x1024, fov 90 deg -> fx=fy=cx=cy=512.
 - Attitude quaternion is (w,x,y,z), body(NED, x-fwd/y-right/z-down)->world; the
   color_left optical axis is body +x, so OpenCV-optical c2w = T @ c2w_ned @ T^-1
@@ -199,7 +197,7 @@ class MidAirDataset(TartanAirDataset):
             P[:3, :3] = _quat_wxyz_to_R(att[gi])
             P[:3, 3] = pos[gi]
             M = np.eye(4); M[:3, :3] = _T_NED
-            c2w = M @ P @ np.linalg.inv(M)             # verified: full_conj + wxyz
+            c2w = M @ P @ np.linalg.inv(M)             # NED body -> OpenCV optical (wxyz quats)
             K_list.append(K_FIXED.copy())
             r_list.append(c2w[:3, :3].copy())
             t_list.append(c2w[:3, 3].copy())

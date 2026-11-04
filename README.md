@@ -21,7 +21,7 @@ and the training loop in `experiments/`, all launched by `main.py`.
 
 ```
 UGG/
-├── ugg/                  inference API: UGG.from_pretrained(), the six tasks, camera + depth coding, video IO
+├── ugg/                  inference API: UGG.from_pretrained(), the six tasks, camera + depth coding, video IO, camera-path videos
 ├── assets/               sample scenes for every task (Bonn, RE10K, DL3DV) + text prompts
 ├── infer.py              command-line inference (Hydra)
 ├── main.py               training entry point (Hydra + Lightning), as in LVP
@@ -42,14 +42,15 @@ UGG/
 
 | | path |
 |---|---|
-| Release weights (28 GB, bf16) | `/n/lab_storage/ydu_lab/Lab/akiruga/world_model_4d/final_release_checkpoints/spdepth_2250_NVS25.7263_BEST.ckpt` |
+| Release weights (30 GB, bf16) | Hugging Face [`amanim71/UGG`](https://huggingface.co/amanim71/UGG) (`ugg_release.safetensors`), downloaded on first use |
 | Wan2.2-TI2V-5B (DiT config, VAE, UMT5-XXL) | Hugging Face `Wan-AI/Wan2.2-TI2V-5B`, cached under `$HF_HOME` |
 
 The release path is set in [configurations/algorithm/ugg.yaml](configurations/algorithm/ugg.yaml)
-(`model.tuned_ckpt_path`); override it with `algorithm.model.tuned_ckpt_path=...`. To fetch the
-base model on a new machine:
+(`model.tuned_ckpt_path`); override it with `algorithm.model.tuned_ckpt_path=...` (a local
+`.safetensors`/`.ckpt` file or `<user>/<repo>/<file>` on the Hub). To fetch everything ahead of time:
 
 ```bash
+huggingface-cli download amanim71/UGG ugg_release.safetensors
 huggingface-cli download Wan-AI/Wan2.2-TI2V-5B --include "config.json" "Wan2.2_VAE.pth" "models_t5_umt5-xxl-enc-bf16.pth" "google/*"
 ```
 
@@ -162,7 +163,7 @@ pred.depth          # (T, H, W) relative depth (up to scale)
 pred.depth_norm     # (T, H, W) raw output: normalized disparity in [-1, 1]
 pred.c2w            # (T, 4, 4) camera-to-world (translation up to scale)
 pred.intrinsics     # (T, 3, 3)
-pred.save("out/")   # rgb.mp4, depth.mp4, *.npy, meta.json
+pred.save("out/")   # rgb.mp4, depth.mp4, cameras.mp4, *.npy, meta.json
 ```
 
 Any call takes `seed`, `sample_steps`, `sample_shift`, `hist_guidance`, `text_guidance`,
@@ -256,13 +257,14 @@ python -m main +name=ugg_finetune experiment=ugg_train algorithm=ugg dataset=mix
 REPO=$PWD HF_HOME=... sbatch scripts/train_release.sbatch data_dir=/path/to/data
 ```
 
-To check that the full model trains on your hardware before a long run (2 GPUs, CPU-offloaded
-optimizer, random data, about 15 minutes, mostly weight loading):
+To check that the full model trains on your hardware before a long run (one node with 4 × 80 GB
+GPUs, random data, about 25 minutes, mostly weight loading):
 
 ```bash
-VWM_SKIP_STARTUP_CHECKPOINT=1 python -m main +name=full_smoke experiment=ugg_train algorithm=ugg dataset=dummy \
+python -m main +name=full_smoke experiment=ugg_train algorithm=ugg dataset=dummy \
   dataset.n_frames=10 dataset.height=160 dataset.width=192 dataset.raymap_height=20 dataset.raymap_width=24 \
-  experiment.training.batch_size=1 experiment.training.max_steps=2 +experiment.fsdp_cpu_offload=true wandb.mode=disabled
+  experiment.training.batch_size=1 experiment.training.max_steps=2 algorithm.save_startup_checkpoint=false \
+  wandb.mode=disabled
 ```
 
 | | release fine-tuning |

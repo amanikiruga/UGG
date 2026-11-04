@@ -2,15 +2,10 @@ defaults:
   - video_base
   - _self_
 
-# BEDLAM (Max Planck synthetic humans), used purely as a geometry source (RGB + metric
-# EXR depth + per-frame moving Unreal cameras). Supports both releases under one tree:
+# BEDLAM (synthetic humans), used as a geometry source: RGB, metric EXR depth and per-frame
+# Unreal cameras. One loader reads both releases; data_root selects which:
 #   v1: <batch>/png + <batch>/depth + <batch>/ground_truth/camera/*.csv
 #   v2: <batch>/png + <batch>/exr_depth + <batch>/ground_truth/meta_exr_csv/*.csv
-# Geometry is identical to TartanAir (OpenCV optical c2w, first-frame-identity, modified-
-# disparity depth, Plucker raymaps); see datasets/bedlam.py and
-# datasets/geometry_verification/bedlam/ (camera convention reproj-verified ~0.2% on
-# camera-moving orbit sequences; dynamic humans account for the residual vs Spring's ~0.05%).
-# BEDLAM v1 and v2 use the same loader; data_root selects the release.
 data_root: ${data_dir}/bedlam
 metadata_path: ""
 load_prompt_embed: true
@@ -18,15 +13,13 @@ caption_cache_dir: ${data_dir}/captions/bedlam
 load_video_latent: false
 trim_mode: random_cut
 pad_mode: slowdown
-# BEDLAM is rendered at 30 fps; sample consecutively (fps == fps_source -> stride 1).
-# Sequences are ~130-450 frames so 50-frame clips fit. ~half of v1 batches (orbit/zoom/
-# pitch) have real camera motion; the rest are static-camera (depth-only supervision).
+# Native 30 fps, sampled consecutively. About half the v1 batches have a moving camera;
+# the rest are static (depth-only supervision).
 fps: 30
 fps_source: 30
 n_frames: 50
 test_percentage: 0.02
-# Same target resolution + raymap grid as TartanAir so the datasets mix cleanly. Source is
-# 1280x720 (16:9); the loader center-crops to the 4:3 target aspect then resizes.
+# The 1280x720 source is center-cropped to 4:3 and resized.
 height: 240
 width: 320
 raymap_height: 30   # height // 8
@@ -40,11 +33,10 @@ augmentation:
   ratio: null
   scale: null
 
-# Per-dataset scale_preserving constant = this datasets measured depth-P90 (scripts/compute_global_scale.py).
-# scale_preserving=True divides BOTH depth and camera-moments by this so each datasets depth-disparity
-# distribution lands in the same ~[0.4,0.9] range -> datasets "look the same" (vs one global 30 that made
-# ASE 2-5m scenes saturate near +1 while vkitti2 130m spread to -1). metric scale preserved WITHIN each dataset.
+# Per-dataset scale (the dataset's depth P90, metres). With scale_preserving=true, depth and camera
+# moments are both divided by it, so every dataset's disparity lands in a similar range while metric
+# scale is preserved within the dataset.
 mutual_scale: 63.0
 
-# record-walk cache (scripts/build_records_manifest.py) — instant startup; delete if data changes
+# Cached list of records, written on first run; delete it if the data changes.
 records_manifest: _records_manifest.json

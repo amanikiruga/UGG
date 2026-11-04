@@ -181,24 +181,12 @@ class WanSelfAttention(nn.Module):
 
 
 class WanT2VCrossAttention(WanSelfAttention):
-    """Text cross-attention. SHARED across the three modality streams -- unlike the
-    self-attention / norms / FFNs above, which are genuinely per-modality (MoT).
+    """Text cross-attention, shared across the three modality streams (unlike the
+    per-modality self-attention, norms and FFNs).
 
-    It inherits WanSelfAttention.__init__, which allocates 3 experts for q/k/v/o.
-    The forward below only ever indexes [0], so experts 1 and 2 were dead weight:
-    8 tensors x dim^2 x 30 blocks = 2.264 B parameters at dim=3072, i.e. 15.3% of the
-    14.821 B model, allocated, FSDP-sharded and checkpointed but never receiving a
-    gradient.
-
-    We now allocate a single expert. Keys are unchanged for the weights that were
-    actually used (they stay `cross_attn.{q,k,v,o}.0.*`), so old checkpoints still load
-    -- the loader uses strict=False, and the stale `.1`/`.2` entries are simply ignored.
-    Numerics are bit-identical: expert 0 is exactly what ran before.
-
-    Note this leaves the text conditioning modality-agnostic. Making it truly MoT (a
-    per-modality q/o with shared k/v from the text context) is a real architecture
-    change that would need retraining -- experts 1 and 2 hold random init, never
-    trained -- so it is deliberately NOT done here.
+    It inherits WanSelfAttention.__init__, which allocates 3 experts for q/k/v/o; only one
+    is used, so a single expert is kept under the same `cross_attn.{q,k,v,o}.0.*` keys.
+    Checkpoints carrying `.1`/`.2` entries still load (strict=False ignores them).
     """
 
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
@@ -683,14 +671,9 @@ class WanModel(ModelMixin, ConfigMixin):
         # L already computed above (RGB-token count); reused here for the output heads.
         #
         # Per-modality timestep modulation. `e` holds 3*T_patch per-frame timesteps in
-        # rgb|ray|depth order (t_model = cat([t_rgb, t_ray, t_depth]) in the algorithm),
-        # but each head processes only ONE modality block of L = T_patch*h*w tokens. The
-        # Head reconstructs L via tokens_per_frame = L // e.shape[1], which requires
-        # e.shape[1] == T_patch (frame-major token order). Passing the full 3*T_patch e
-        # only divides L evenly when h*w is a multiple of 3 (true for the 1.3B 30x40 ->
-        # h*w=300 latent, FALSE for the 5B 15x20 -> h*w=70 latent: 980//42=23 -> 966!=980).
-        # Slice e to each modality's own T_patch frames so the modulation is both correct
-        # (frame-major) and shape-consistent for any latent grid.
+        # rgb|ray|depth order, but each head processes only one modality block of
+        # L = T_patch*h*w tokens and needs e.shape[1] == T_patch (frame-major order), so e is
+        # sliced to each modality's own T_patch frames.
         e_rgb, e_ray, e_depth = _split_modality_time_embeddings(
             e, per_modality_frames=int(T_patch)
         )

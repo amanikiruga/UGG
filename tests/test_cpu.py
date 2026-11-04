@@ -55,7 +55,7 @@ def test_training_recipe():
     assert a.lr_scheduler.name == "warmup_hold_cosine" and a.lr_scheduler.min_lr_rate == 1.0
     assert a.gradient_checkpointing_rate == 0.93 and a.vae.encoder_compile and a.vae.merge_flf_chunks
     df = a.diffusion_forcing
-    assert df.mode == "ray_depth_prediction_firstlast" and df.train_rgb and df.mask_clean_token_loss
+    assert df.mode == "ray_depth_prediction_firstlast" and df.mask_clean_token_loss
     assert list(df.subset_settings.re10k) == [0, 1, 2, 3]
     assert (cfg.dataset.height, cfg.dataset.width, cfg.dataset.n_frames) == (288, 384, 50)
 
@@ -153,6 +153,33 @@ def test_camera_and_depth_encoding_roundtrip():
     assert e[0, 0, 0] == -1 and (e[d > 0] > -1).all() and (e <= 1).all()
     back = depth_from_norm(np.where(d > 0, e, 0.0), percentile_clip=None)
     np.testing.assert_allclose(back[d > 0] / np.median(back[d > 0]), d[d > 0] / np.median(d[d > 0]), rtol=2e-3)
+
+
+def test_prediction_save_writes_camera_video(tmp=None):
+    import tempfile
+
+    import imageio.v3 as iio
+
+    from ugg import Prediction
+    from ugg.camviz import render_cameras
+
+    T, H, W = 10, 32, 48
+    t = np.linspace(0, 1, T)
+    c2w = np.tile(np.eye(4), (T, 1, 1))
+    c2w[:, 0, 3], c2w[:, 2, 3] = np.sin(t), t  # a curving forward path
+    a = render_cameras(c2w, 160, 120)
+    assert len(a) == T and a[0].size == (160, 120)
+    assert all(np.array_equal(np.asarray(x), np.asarray(y)) for x, y in zip(a, render_cameras(c2w, 160, 120)))
+    assert not np.array_equal(np.asarray(a[0]), np.asarray(a[-1]))  # the active camera moves
+    K = np.tile(np.array([[40.0, 0, W / 2], [0, 40.0, H / 2], [0, 0, 1]]), (T, 1, 1))
+    pred = Prediction(rgb=np.zeros((T, H, W, 3), np.uint8), depth_norm=np.zeros((T, H, W), np.float32),
+                      depth=np.ones((T, H, W), np.float32), c2w=c2w, intrinsics=K,
+                      raymaps=np.zeros((T, 6, H, W), np.float32), frame_indices=np.arange(T))
+    out = Path(tmp or tempfile.mkdtemp())
+    pred.save(out)
+    for f in ("rgb.mp4", "depth.mp4", "cameras.mp4", "c2w.npy", "meta.json"):
+        assert (out / f).exists(), f
+    assert iio.imread(out / "cameras.mp4").shape == (T, 480, 640, 3)
 
 
 if __name__ == "__main__":

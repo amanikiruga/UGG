@@ -1,16 +1,9 @@
 """ASE (Aria Synthetic Environments) dataset: fisheye RGB + GT range-depth + poses.
 
-Meta's 100k synthetic Aria interior scenes. On Isambard the data is 58 SquashFS
-images (mount with /projects/u6el/aak81/datasets/projectaria/mount_ase.sh).
+Meta's synthetic Aria interior scenes. Geometry follows projectaria_tools
+(AseCalibrationProvider.cpp).
 
-Geometry is reverse-engineered from the authoritative projectaria_tools source
-(AseCalibrationProvider.cpp) and verified to 0.06-0.10% frame i->j reprojection
-error (datasets/geometry_verification/aria/check_raw_reproj.py). The legacy
-datasets/aria.py uses a DIFFERENT (Harvard) convention that is WRONG for ASE
-(fabricated hardware rotation, baked-in image roll + rot90, z-instead-of-range,
-inverted extrinsic); do not reuse it. This loader is the correct one.
-
-Conventions (verified):
+Conventions:
 - Raw frames: fisheye 704x704 RGB (rgb/vignette*.jpg); depth (depth/depth*.png)
   uint16 = RANGE in mm (Euclidean distance from the camera centre, NOT planar z).
 - Undistort fisheye->pinhole 640x480 via the offline maps (ase_undistort_maps.npz),
@@ -34,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import cv2
-cv2.setNumThreads(0)  # libpng+zlib decoder is NOT thread-safe on multi-core nodes -> "bad parameters to zlib" -> imread returns None. Force single-threaded decode (dataloader workers + this module).
+cv2.setNumThreads(0)  # cv2's threaded PNG decode can fail (imread returns None); decode single-threaded.
 
 import numpy as np
 import torch
@@ -51,11 +44,9 @@ from .video_base import VideoDataset
 from ._geometry_constants import GLOBAL_SCALE
 from ._scale_norm import is_scale_norm_mode, apply_scale_norm
 
-# Offline undistort maps (pinhole 640x480 <- fisheye 704x704). Verified against
-# projectaria_tools distort_by_calibration to sub-pixel accuracy.
-# PORTRAIT undistort target (480x640): rot90(k=3) -> 640x480 upright LANDSCAPE (4:3), so no
-# crop is needed and the full sensor FOV is kept (~85deg H x 69deg V vs ~69x54 with the old
-# 640x480 maps that had to be cropped after rotation).
+# Offline undistort maps (pinhole <- fisheye 704x704), matching projectaria_tools
+# distort_by_calibration. The target is portrait 480x640; rot90(k=3) makes it an upright
+# 640x480 landscape (4:3) frame, so no crop is needed and the full sensor FOV is kept.
 _MAPS_PATH = Path(__file__).parent / "geometry_verification" / "aria" / "ase_undistort_maps_portrait.npz"
 
 PIN_W, PIN_H = 480, 640              # undistorted pinhole resolution (portrait; remap out is HxW=640x480)
@@ -86,11 +77,9 @@ def _Rz(deg: float) -> np.ndarray:
     return M
 
 
-# The Aria RGB sensor is mounted rotated, so the undistorted (portrait 640x480) frame is sideways.
-# Make it UPRIGHT with np.rot90(k=3) (90deg CW) of the image, paired with a +90deg roll of the
-# camera optical frame and a re-centred intrinsics. With the portrait maps the rotated frame is
-# 640x480 LANDSCAPE (4:3) directly -> no crop. Verified self-consistent: reproj 0.0007, identical
-# to the un-rotated frame (datasets/geometry_verification/aria/check_upright.py).
+# The Aria RGB sensor is mounted rotated, so the undistorted frame is sideways. It is made upright
+# with np.rot90(k=3) (90deg CW), paired with a +90deg roll of the camera optical frame and
+# re-centred intrinsics.
 _ROT_K = 3
 _UP_W, _UP_H = PIN_H, PIN_W                                   # 640 x 480 after rot90 (landscape 4:3)
 _K_UPRIGHT = np.array([[350.0, 0.0, (_UP_W - 1) / 2.0],
@@ -133,11 +122,9 @@ class ASEDataset(VideoDataset):
     # ---- Records ----
 
     def _load_records(self) -> List[Dict[str, Any]]:
-        # 20,880 scenes over a FUSE union mount: do ONE iterdir and DON'T touch each
-        # scene (no per-scene glob/stat). n_frames is filled lazily in _load_video from
-        # the trajectory (which is read there anyway). Scenes are uniform 0..N-1.
-        # A scene is EITHER a loose dir `<id>/` OR a packed archive `<id>.zip` (one
-        # inode instead of ~1800; see ASE_ZIP_PACKING). Enumerate both in one iterdir.
+        # One iterdir, no per-scene stat (there are tens of thousands of scenes). n_frames is
+        # filled lazily in _load_video from the trajectory. A scene is either a loose dir
+        # `<id>/` or a packed archive `<id>.zip`.
         records: List[Dict[str, Any]] = []
         loose, packed = {}, {}
         for p in self.data_root.iterdir():
@@ -228,9 +215,7 @@ class ASEDataset(VideoDataset):
     def _undistort_rgb(self, buf: bytes, tag: str) -> np.ndarray:
         img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
-            # missing/truncated frame (e.g. scene from an interrupted download chunk);
-            # raise OSError so __getitem__'s bounded retry resamples instead of the
-            # bare AttributeError killing the DataLoader worker.
+            # missing/truncated frame: raise OSError so __getitem__'s retry resamples
             raise OSError(f"unreadable rgb {tag}")
         img = img[..., ::-1]                                      # BGR->RGB, 704x704
         return cv2.remap(np.ascontiguousarray(img), self._map_x, self._map_y,
@@ -240,9 +225,7 @@ class ASEDataset(VideoDataset):
         """Decode fisheye range-depth (mm) -> undistort -> metric planar z (m) + valid mask."""
         d = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_UNCHANGED)
         if d is None:
-            # cv2's libpng path sporadically returns None for these uint16 PNGs
-            # depending on process state (zlib decoder-state bug family) even
-            # though the bytes are intact; imageio decodes them reliably.
+            # cv2 sporadically returns None for these uint16 PNGs; imageio decodes them reliably.
             try:
                 import imageio.v3 as _iio
                 d = np.asarray(_iio.imread(io.BytesIO(buf)))
@@ -316,11 +299,11 @@ class ASEDataset(VideoDataset):
         return torch.stack(raymaps, 0), torch.stack(exts, 0), torch.stack(ks, 0)
 
     def _apply_mutual_scale(self, raymaps_raw, depth_metric):
-        # scale_preserving=True -> ONE global constant (GLOBAL_SCALE) divides BOTH camera
-        # moments and depth so metric scale is preserved across the mixture. Else per-clip.
+        # scale_preserving=True: one constant (mutual_scale, else GLOBAL_SCALE) divides both camera
+        # moments and depth, so metric scale is preserved. Otherwise the scale is per clip.
         moments = raymaps_raw[:, 3:6]
         if is_scale_norm_mode(self.cfg):
-            # Scheme C (SCALE_NORMALIZATION_ANALYSIS.md): per-clip s = kappa*median(valid depth).
+            # scale_mode=parallax: per-clip s = kappa*median(valid depth).
             # d_for_scale stuffs invalid pixels with FAR_PLANE_M*10; exclude them.
             return apply_scale_norm(raymaps_raw, depth_metric, self.cfg, FAR_PLANE_M * 10)
         elif self.cfg.get("scale_preserving", False):
@@ -382,10 +365,7 @@ class ASEDataset(VideoDataset):
         return frames, raymaps, depths, scale, ext_gt, K_gt, depths_raw, depths_valid
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion): recursive retries pin each level's
-        # partially-decoded tensors via the exception traceback; with many failing
-        # records (e.g. bedlam2's misnamed depth files) DataLoader workers ballooned
-        # to ~100GB and were OOM-killed, silently losing the sample.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -393,8 +373,7 @@ class ASEDataset(VideoDataset):
                 break
             except (OSError, ValueError, KeyError, RuntimeError) as e:
                 print(f"Warning: skipping {record.get('seq_id', idx)}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
@@ -407,12 +386,8 @@ class ASEDataset(VideoDataset):
             "width": frames.shape[3],
             "has_caption": False,
         }
-        # Use the caption cache when configured. `_select_caption` returns
-        # (caption, ABSOLUTE prompt-embed path) for this scene, picking a random
-        # caption variant per __getitem__. Previously this loader read only
-        # record["caption"] and its _load_prompt_embed returned a ZERO tensor, so a
-        # configured caption_cache_dir was silently ignored and every clip trained
-        # with a null text embedding.
+        # Use the caption cache when configured: `_select_caption` returns (caption, absolute
+        # prompt-embed path), picking a random caption variant per call.
         _cap = self._select_caption(record)
         _embed_override = None
         if _cap is not None:
@@ -421,10 +396,7 @@ class ASEDataset(VideoDataset):
             _caption = record.get("caption", "")
         prompts = self.id_token + _caption
         prompt_embeds, prompt_embed_len = None, None
-        # A cache miss is NOT a reason to drop the sample. `_load_prompt_embed_or_null`
-        # falls back to the null embedding (what this subset trained on before captions
-        # were wired up) instead of raising into MixtureDataset's except/continue, which
-        # would make every uncaptioned scene unreachable.
+        # A cache miss falls back to the null embedding rather than dropping the sample.
         _has_caption = _embed_override is not None or bool(_caption)
         if self.load_prompt_embed:
             (
@@ -434,8 +406,7 @@ class ASEDataset(VideoDataset):
             ) = self._load_prompt_embed_or_null(
                 record, path_override=_embed_override
             )
-        # Keep the metadata honest: a cache hit means this clip really does have a
-        # caption, regardless of what record["caption"] said at index time.
+        # A cache hit means this clip has a caption, whatever record["caption"] says.
         video_metadata["has_caption"] = _has_caption
 
         record["height"] = video_metadata["height"]
@@ -457,13 +428,9 @@ class ASEDataset(VideoDataset):
             "prompts": prompts,
         }
         if self._clip_motion_too_fast(ext_gt, depths_raw, depths_valid):
-            # PER-CLIP motion gate: ASE is head-mounted walking at an intrinsic
-            # 10 fps (100 ms steps, nothing denser to sample), so some windows
-            # whip around far faster than the rest of the mixture. Those clips
-            # supervise DEPTH ONLY: dropping the camera keys makes the mixture
-            # set has_raymap=False -> ray tokens noise-filled + loss-masked, and
-            # the algorithm additionally bars settings 2/3 (rays-as-history)
-            # for has_raymap=False samples. Calm windows keep full supervision.
+            # Optional per-clip motion gate: clips that move much faster than the rest of the
+            # mixture supervise depth only (dropping the camera keys sets has_raymap=False, so
+            # ray tokens are noise-filled and loss-masked).
             for k in ("raymaps", "raymap_scale", "extrinsics_gt", "intrinsics_gt"):
                 output.pop(k)
         if prompt_embeds is not None:

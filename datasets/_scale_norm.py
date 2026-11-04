@@ -1,27 +1,20 @@
-"""Scheme-C "parallax" normalization — opt-in cross-dataset scale scheme.
+"""Parallax scale normalization (`dataset.scale_mode=parallax`), shared by every geometry loader.
 
-Documented in full in repo-root SCALE_NORMALIZATION_ANALYSIS.md. Enabled per-run by the
-hydra flag `dataset.scale_mode=parallax` (propagated to every subset by MixtureDataset);
-`dataset.parallax_kappa` sets kappa (default 4.0). When the flag is absent every loader
-keeps its exact prior behavior (per-clip max|moment| or the scale_preserving constant).
+Enabled by `dataset.scale_mode=parallax` (propagated to every subset by MixtureDataset);
+`dataset.parallax_kappa` sets kappa (default 4.0). Without the flag every loader keeps its
+default behaviour (per-clip max|moment| or the scale_preserving constant).
 
-Recipe (identical across all geometry datasets):
+Recipe:
   s = kappa * median(valid metric depth over the clip)          # per-clip scalar
-  moments <- clamp(moments / s, -1, 1)                          # -> scene-relative parallax
-  depth   <- 2 / (1 + clamp(depth / s, 0)) - 1                  # -> fixed operating point
+  moments <- moments / s                                         # scene-relative parallax
+  depth   <- depth channel map of depth / s (see parallax_depth_map)
 
-Why one shared scalar for BOTH channels: dividing camera translation (carried by the
-Plucker moments m = t x d) and depth by the same s is a global similarity (uniform scene
-scale), under which projection / point-cloud formation is exactly invariant — so predicted
-depth and pose stay aligned (verified to machine precision; see doc 4b). Normalizing the two
-channels by *different* scalars would desync them and is therefore forbidden.
+Dividing camera translation (carried by the Pluecker moments m = t x d) and depth by the same s
+is a uniform rescaling of the scene, under which projection is invariant, so predicted depth and
+pose stay aligned. Normalizing the two channels by different scalars would desync them.
 
-Moments are deliberately NOT clamped to [-1, 1] here: the model does not use a fixed-range
-VAE latent for the raymap channels, so out-of-range moments are fine, and skipping the clamp
-keeps the (depth, pose) mapping EXACTLY invertible / alignment-preserving for 100% of clips
-(clamping was the only op that could desync moments from depth). kappa=4 merely keeps the
-bulk near unit magnitude (pooled normalized-moment P99 ~= 5.3 across 1,459 clips / 12
-datasets) so the channel is well-conditioned; the tail is allowed to exceed 1.
+Moments are only bounded by a loose safety clamp (PARALLAX_MOMENT_CLAMP_DEFAULT): the raymap
+channels bypass the VAE, so values beyond 1 are fine. kappa=4 keeps the bulk near unit magnitude.
 """
 from typing import Optional
 
@@ -32,36 +25,23 @@ GLOBAL_METRIC_MODE = "global_metric"
 PARALLAX_KAPPA_DEFAULT = 4.0
 GLOBAL_METRIC_SCALE_DEFAULT = 10.0   # metres; ONE global constant for scale_mode=global_metric
 PARALLAX_ZBAR_FLOOR_M = 1e-2   # metres; guards degenerate near-zero-depth clips
-# scheme-C depth channel map. "log" (default) = 1 - 2*clip(alpha*ln(d/median + 1), 0, 1); "disparity"
-# = 2/(1+d/s)-1 (the original). The log map is FAR more robust through the VAE latent: the frozen
-# Wan2.2 VAE round-trips log-mapped depth at ~3% abs_rel vs ~45% for disparity (which crushes far/
-# deep scenes into a razor-thin slice near -1 whose 1/u inversion explodes under VAE channel noise).
-# Both orient near->+1, far->-1, invalid(sentinel)-> -1. alpha=0.30 puts the P99 depth at the far end.
+# Parallax depth channel map. "log" (default) = 1 - 2*clip(alpha*ln(d/median + 1), 0, 1); "disparity"
+# = 2/(1+d/s)-1. The log map survives the VAE round trip far better: disparity crushes far depths into
+# a thin slice near -1 whose inversion is unstable. Both map near->+1, far->-1, invalid -> -1.
 PARALLAX_DEPTH_MAP_DEFAULT = "log"
 PARALLAX_LOG_ALPHA_DEFAULT = 0.30
-# scheme-C ray channels 3:6. "companded_origin" (default) = Aether-style: replace the Plucker
-# moment with the camera ORIGIN t (first-frame gauge), normalized by the shared s and mu-law
-# companded  co = sign(t/s)*ln(1+mu*|t/s|)/ln(1+mu). Fixes (a) the moment's cross-product
-# attenuation of forward/dolly motion (|m| = |t|sin(theta), ~0 at image center) and (b) tiny
-# values in low-parallax clips (mu=255 gives ~46x gain near 0; spring med 0.0035 -> 0.116).
-# Exactly invertible; decode = spatial mean -> mu-law expand -> *s (see re10k.raymap_to_camera).
-# "moment" keeps the original Plucker moment / s. Direction channels 0:3 unchanged either way.
+# Parallax ray channels 3:6. "companded_origin" (default) replaces the Pluecker moment with the
+# camera origin t (first-frame gauge), normalized by the shared s and mu-law companded:
+# co = sign(t/s)*ln(1+mu*|t/s|)/ln(1+mu). This avoids the moment's attenuation of forward motion
+# (|m| = |t| sin(theta)) and boosts small low-parallax values. Exactly invertible (spatial mean ->
+# mu-law expand -> *s; see re10k.raymap_to_camera). "moment" keeps the Pluecker moment / s.
+# Direction channels 0:3 are unchanged either way.
 PARALLAX_RAY_ENCODING_DEFAULT = "companded_origin"
 PARALLAX_MU_DEFAULT = 255.0
-# Ceiling on the gauge-normalised Plucker moment. In PARALLAX mode every dataset routes
-# through apply_parallax / _divide_and_disparity below, and BOTH were unclamped -- whereas
-# every dataset's own MAX-NORM path already does clamp(moments/scale, -1, 1). That asymmetry
-# is why gauge-normalised runs see unbounded ray inputs and max-norm runs never do, and
-# it is how a single diverged COLMAP pose once reached the model as 9.24e10 (one DL3DV
-# frame, grad_norm 9.9e6).
-#
-# The moment IS signal: |m|/s ~ |t|/(2*zbar), i.e. translation per unit scene depth, so the
-# large values are high-parallax clips, not noise. Measured element-level magnitudes under
-# the gauge: median 0.035-0.074, p99 0.87-1.40, largest legitimate value seen 8.40
-# (tartanair_v2). A bound of 10 therefore alters ~0% of real data while capping the
-# pathology; a bound of 1 would clip ~2.1% of tartanair elements (60% of the mixture) and
-# 0.6% of tartanair_v2 -- the most pose-informative content. Set to None to restore the
-# old unbounded behaviour.
+# Ceiling on the gauge-normalised Pluecker moment, a guard against diverged poses. The moment
+# is signal (|m|/s ~ translation per unit scene depth) and legitimate values stay well below 10,
+# so this bound leaves real data untouched, while a bound of 1 would clip high-parallax clips.
+# None disables the clamp.
 PARALLAX_MOMENT_CLAMP_DEFAULT = 10.0
 
 
@@ -205,7 +185,7 @@ def parallax_scale_from_sentinel(depth_metric: torch.Tensor, cfg,
 
 def apply_parallax(raymaps_raw: torch.Tensor, depth_metric: torch.Tensor, cfg,
                    invalid_sentinel: float):
-    """Full scheme-C normalization, returning (raymaps_norm, depth_channel, scale) exactly like
+    """Full parallax normalization, returning (raymaps_norm, depth_channel, scale) exactly like
     each loader's `_apply_mutual_scale`. Moments are divided by the single per-clip scalar
     s = kappa*median(valid depth) and NOT clamped (no VAE range constraint) so depth<->pose stay
     exactly aligned. The DEPTH channel uses parallax_depth_map(cfg): 'log' (default, VAE-robust)
@@ -230,7 +210,7 @@ def apply_parallax(raymaps_raw: torch.Tensor, depth_metric: torch.Tensor, cfg,
 
 
 def _disparity_depth(depth_metric, scale):
-    """Original scheme-C depth map: 2/(1+d/s)-1 in (-1,1], invalid(large d)-> -1."""
+    """Disparity depth map: 2/(1+d/s)-1 in (-1,1], invalid(large d)-> -1."""
     depth_scaled = torch.clamp(depth_metric / scale, min=0.0)
     return 1.0 / (1.0 + depth_scaled) * 2.0 - 1.0
 

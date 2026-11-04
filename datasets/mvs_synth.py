@@ -5,9 +5,7 @@ Layout (<data_root>/GTAV_540/):
     <seq %04d>/depths/%04d.exr    float32 'Y' channel, Z-DEPTH metres, inf = sky
     <seq %04d>/poses/%04d.json    {f_x,f_y,c_x,c_y, extrinsic: 4x4 WORLD-TO-CAMERA}
 
-Geometry (verified datasets/geometry_verification/mvs_synth/check_raw_reproj.py on
-3 seqs: 0.08-0.13% median rel depth reproj error; ray-depth 6-12%, OpenGL axes 30-50%,
-c2w-as-stored lands off-screen):
+Geometry:
 - extrinsic is w2c in OpenCV axes -> c2w = inv(extrinsic). Per-frame K from the json.
 - Depth is plain z-depth (metres); inf/far masked via FAR_PLANE_M.
 - Crop/resize, raymaps, mutual scale, modified disparity inherited from TartanAir.
@@ -135,7 +133,7 @@ class MVSSynthDataset(TartanAirDataset):
             K = np.array([[p["f_x"], 0.0, p["c_x"]],
                           [0.0, p["f_y"], p["c_y"]],
                           [0.0, 0.0, 1.0]], dtype=np.float64)
-            c2w = np.linalg.inv(np.array(p["extrinsic"], dtype=np.float64))  # w2c verified
+            c2w = np.linalg.inv(np.array(p["extrinsic"], dtype=np.float64))  # stored as w2c
             K_list.append(K)
             r_list.append(c2w[:3, :3].copy())
             t_list.append(c2w[:3, 3].copy())

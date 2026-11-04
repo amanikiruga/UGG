@@ -45,10 +45,9 @@ class VideoDataset(Dataset):
         self.filtering = cfg.filtering
         self.load_video_latent = cfg.load_video_latent
         self.load_prompt_embed = cfg.load_prompt_embed
-        # Opt-in caption+embedding cache (annotations/<ds>/ with captions.csv +
-        # prompt_embeds/). Off unless cfg.caption_cache_dir is set -> zero change
-        # for existing runs. A loader sets SCENE_ID_KEY to the record field whose
-        # value matches captions.csv 'scene_id'.
+        # Optional caption + embedding cache (captions.csv + prompt_embeds/ under
+        # cfg.caption_cache_dir). A loader sets SCENE_ID_KEY to the record field matching
+        # captions.csv 'scene_id'.
         self.caption_cache = None
         _ccd = getattr(cfg, "caption_cache_dir", None)
         if _ccd:
@@ -129,16 +128,11 @@ class VideoDataset(Dataset):
         return transforms.Compose(trans)
 
     def _load_records_cached(self) -> List[Dict[str, Any]]:
-        """Records-manifest cache. Walk-based loaders (tartanair/ase/bedlam/matrixcity/
-        mid_air/mvs_synth/scenenet/…) rebuild their record list by stat-storming the
-        filesystem in `_load_records()` at EVERY process start — painful at 32-rank
-        distributed launch (every rank walks the data tree). If `cfg.records_manifest` is
-        set, the post-split/post-preprocess record list is cached to a per-split JSON:
-        first run walks + writes it, later runs load it instantly. Records are plain
-        dicts (paths/ints/lists) so JSON round-trips exactly.
-
-        Build once with `scripts/build_records_manifest.py`. Manifest is stale if the
-        data changed — delete it (or omit the cfg key) to force a re-walk."""
+        """Records-manifest cache. Walk-based loaders rebuild their record list by walking the
+        data tree in `_load_records()`, which is slow when every rank does it at launch. If
+        `cfg.records_manifest` is set, the post-split record list is cached to a per-split JSON:
+        the first run walks and writes it, later runs load it. Delete the manifest (or omit the
+        key) after the data changes."""
         mrel = self.cfg.get("records_manifest", None)
         if not mrel:
             return self._load_records()
@@ -146,9 +140,8 @@ class VideoDataset(Dataset):
             mp = Path(mrel)
             mp = mp.with_name(f"{mp.stem}.{self.split}{mp.suffix or '.json'}")
         else:
-            # A relative value resolves to a single WRITABLE manifest dir (data_roots are
-            # often read-only), keyed by data_root so bedlam vs
-            # bedlam2 vs tartanair get distinct files. Override dir via VWM_MANIFEST_DIR.
+            # A relative value resolves inside one writable manifest dir (data roots may be
+            # read-only), keyed by data_root. Override the dir with VWM_MANIFEST_DIR.
             mroot = Path(os.environ.get(
                 "VWM_MANIFEST_DIR",
                 os.path.expanduser("~/.cache/ugg/records_manifests")))
@@ -173,20 +166,9 @@ class VideoDataset(Dataset):
 
 
     # ---- manifest staleness guard -------------------------------------------------
-    # A records manifest is a CACHE of a filesystem walk. When the data underneath it
-    # changes, the cache keeps working and silently misrepresents the corpus -- there is
-    # no error, just wrong data. Three separate instances of this were found in the
-    # 2026-08-25 dataset audit, each silent:
-    #   * ASE finished downloading after its manifest was built -> training drew from
-    #     37,373 of 91,368 scenes (59% of the corpus unreachable).
-    #   * dl3dv's manifest had frozen absolute prompt-embed paths, so repointing the
-    #     config at a regenerated embed store had no effect until the manifest was deleted.
-    #   * scenenet's manifest listed 16,865 records whose pose files had been purged;
-    #     every sample raised, was swallowed by MixtureDataset, and the subset silently
-    #     contributed nothing.
-    # The guard below is deliberately cheap -- one listdir of data_root, no walk -- and
-    # only WARNS. It never refuses to train and never rebuilds behind your back; the fix
-    # is always to delete the manifest so the next run re-walks.
+    # A records manifest caches a filesystem walk; if the data changes underneath it, it
+    # silently describes the wrong corpus. This cheap check (the data_root mtime) only warns;
+    # delete the manifest to force a re-walk.
     @staticmethod
     def _is_rank_zero() -> bool:
         for k in ("SLURM_PROCID", "RANK", "LOCAL_RANK"):
@@ -199,10 +181,8 @@ class VideoDataset(Dataset):
         return True
 
     def _manifest_signature(self):
-        """O(1) fingerprint of the data root: its mtime, which the filesystem bumps
-        whenever an entry is added or removed. Deliberately NOT a child count -- counting
-        ASE's 92,290 entries costs 1.3 s cold per rank, and 512 ranks doing that at launch
-        is precisely the filesystem metadata storm this manifest cache exists to avoid."""
+        """O(1) fingerprint of the data root: its mtime, which changes whenever an entry is
+        added or removed (a child count would be too slow on large roots)."""
         try:
             st = os.stat(str(self.data_root))
             return {"data_root": str(self.data_root), "mtime": int(st.st_mtime)}
@@ -225,7 +205,7 @@ class VideoDataset(Dataset):
 
     def _warn_if_manifest_stale(self, mp: Path, recs) -> None:
         if not self._is_rank_zero():
-            return                                    # one voice per launch, not 512
+            return                                    # warn once per launch
         sp = self._signature_path(mp)
         cur = self._manifest_signature()
         if cur is None:
@@ -421,9 +401,8 @@ class VideoDataset(Dataset):
         """
 
         video_path = self.data_root / record["video_path"]
-        # Seek-read only the sampled frames instead of decoding the whole video
-        # (iio.imread(index=None) loaded entire clips into RAM -> per-worker OOM).
-        # num_threads=1 avoids decord's threaded-decoder EAGAIN bug.
+        # Seek-read only the sampled frames instead of decoding the whole video.
+        # num_threads=1 avoids decord's threaded-decoder EAGAIN error.
         vr = decord.VideoReader(video_path.as_posix(), num_threads=1)
         n_frames = len(vr)
         start = record.get("trim_start", 0)
@@ -509,11 +488,8 @@ class VideoDataset(Dataset):
         # Handle split selection
         if self.split != "all":
             if "split" in records[0]:
-                # Use split field from records. Accept {validation, val, test}
-                # as mutually-aliased holdout splits — individual dataset csvs
-                # disagree on which label they use (scenenet uses "val",
-                # others use "validation", exp_base requests "test"), so we
-                # treat them all as equivalent for the non-training splits.
+                # Use split field from records. {validation, val, test} are treated as
+                # the same holdout split, since dataset csvs use different labels.
                 aliases = {
                     "training": {"training"},
                     "test": {"test", "validation", "val"},
@@ -620,9 +596,7 @@ class VideoDataset(Dataset):
 
         return image_latent, video_latent
 
-    # Rate-limited miss reporting. A high miss rate is a data problem worth seeing,
-    # but printing per sample inside a DataLoader worker floods the log, so report
-    # the first miss and then at exponentially growing intervals.
+    # Rate-limited miss reporting: the first miss, then at exponentially growing intervals.
     _caption_miss_count = 0
     _caption_hit_count = 0
 
@@ -646,20 +620,10 @@ class VideoDataset(Dataset):
 
         Returns (embed, len, has_caption).
 
-        Datasets whose captions were generated for only part of the corpus (ASE 59%,
-        OmniWorld 54%, MatrixCity 69% missing) have no `prompt_embed_path` on the
-        record and no cache entry. Calling `_load_prompt_embed` for those raises
-        ValueError, and `MixtureDataset.__iter__` swallows the exception and redraws
-        -- so the scene becomes silently UNREACHABLE and its decoded video is thrown
-        away. That trades a caption bug for a much worse coverage bug.
-
-        Instead we fall back to the zero embedding, which is exactly what these
-        subsets trained against before captions were wired up, so coverage is
-        unchanged and captions are used wherever they exist.
-
-        This lives here rather than inside `_load_prompt_embed` on purpose: datasets
-        that genuinely require `prompt_embed_path` (re10k, dl3dv_colmap) must keep
-        failing loudly rather than quietly training on zeros.
+        Some datasets are only partly captioned. Uncaptioned scenes fall back to the zero
+        embedding instead of raising (which the mixture would swallow, making the scene
+        unreachable). Datasets that require `prompt_embed_path` (re10k, dl3dv_colmap) call
+        `_load_prompt_embed` directly and still fail loudly.
         """
         if path_override is None and "prompt_embed_path" not in record:
             self._note_caption_miss(hit=False)

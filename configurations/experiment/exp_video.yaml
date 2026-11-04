@@ -16,7 +16,6 @@ training:
   async_checkpointing: true
   checkpointing:
     every_n_train_steps: 150
-    # every_n_train_steps: 1000
     every_n_epochs: null
     save_weights_only: true
     # "link" -> last.ckpt is a symlink to the newest step ckpt instead of a

@@ -1,28 +1,20 @@
-# UGG release model: Wan2.2-TI2V-5B backbone, mixture-of-transformers over
-# [rgb | ray | depth], trained with diffusion forcing. Sampling defaults are the ones used
-# for the paper's evaluation; the training keys are the release fine-tuning recipe.
-# Override anything from the command line, e.g.
+# UGG: Wan2.2-TI2V-5B with a mixture of transformers over [rgb | ray | depth], trained with
+# diffusion forcing. Sampling defaults are the ones used for evaluation; the training keys
+# are the release fine-tuning recipe. Override anything from the command line, e.g.
 #   python -m main algorithm=ugg algorithm.hist_guidance=2.0 algorithm.sample_steps=20
 defaults:
-  - wan_t2v_ray_depth_mot_concat_5b
+  - base_pytorch_algo
   - _self_
 
-model:
-  # Release weights (weights-only warm start; see configure_model).
-  tuned_ckpt_path: /n/lab_storage/ydu_lab/Lab/akiruga/world_model_4d/final_release_checkpoints/spdepth_2250_NVS25.7263_BEST.ckpt
-  compile: false
-  # Keep only the first N transformer blocks. Smoke tests only; null = full model.
-  debug_num_layers: null
-
-vae:
-  compile: false
-  encoder_compile: true    # torch.compile the VAE encoder: 2x faster training step (~145 s compile)
-  merge_flf_chunks: true   # 3 encoder passes instead of 14; mathematically exact
-
-text_encoder:
-  compile: false
+n_frames: ${dataset.n_frames}
+height: ${dataset.height}
+width: ${dataset.width}
+load_video_latent: ${dataset.load_video_latent}
+load_prompt_embed: ${dataset.load_prompt_embed}
+max_text_tokens: 512
 
 # ---- sampling ----------------------------------------------------------------------
+num_train_timesteps: 1000
 sample_steps: 40
 sample_solver: unipc
 sample_shift: 3.0
@@ -30,25 +22,91 @@ hist_guidance: 1.0   # history (clean-frame) guidance; 0 disables the extra forw
 lang_guidance: 0.0   # text guidance; > 0 needs the T5 encoder (load_prompt_embed=false)
 neg_prompt: ""
 
-# ---- training recipe (inert at inference) -------------------------------------------
-gf_freeze_depth: true          # depth expert frozen; needs experiment.fsdp_use_orig_params
-gradient_checkpointing_rate: 0.93
-optimizer_impl: adamw           # adamw8bit halves optimizer memory but then needs experiment.training.checkpointing.save_weights_only=true (FSDP cannot gather its mixed-dtype state)
-rescale_lr_on_resume: true          # resume keeps the configured LR, not the one saved in the ckpt
-rng_allow_world_size_change: true   # resuming on a different GPU count re-derives per-rank RNG
+# ---- diffusion forcing -------------------------------------------------------------
+diffusion_forcing:
+  enabled: true
+  mode: ray_depth_prediction_firstlast
+  clean_hist_prob: 0.5           # history frames are fully clean with this probability
+  depth_loss_weight: 1.0         # total = (rgb + ray_d + ray_m + w * depth) / (3 + w)
+  mask_clean_token_loss: true    # clean (t = 0) tokens are context, not loss targets
+  # Conditioning settings each training subset may draw (see add_training_noise):
+  #   0 first RGB -> rest      1 all RGB -> rays + depth      2 first/last RGB + rays -> RGB + depth
+  #   3 first RGB + rays -> RGB + depth                       4 first RGB + depth -> RGB + rays
+  subset_settings:
+    tartanair:      [0, 1, 2, 3, 4]
+    tartanair_v2:   [1]
+    spring:         [0, 1, 2, 3, 4]
+    bedlam:         [0, 1, 2, 3, 4]
+    bedlam2:        [0, 1, 2, 3, 4]
+    vkitti2:        [0, 1, 2, 3, 4]
+    mid_air:        [0, 1, 2, 3, 4]
+    mvs_synth:      [0, 1, 2, 3, 4]
+    ase:            [1]
+    scenenet:       [1]
+    matrixcity:     [1]   # depth only: cameras are not used (has_raymap=false)
+    omniworld_game: [1]   # depth only: cameras are not used (has_raymap=false)
+    re10k:          [0, 1, 2, 3]   # no depth: depth tokens are noise and loss-masked
+    dl3dv_colmap:   [2, 3]         # no depth: depth tokens are noise and loss-masked
+
+# ---- training recipe (inert at inference) ------------------------------------------
+lr: ${experiment.training.lr}
+betas: [0.9, 0.95]
+weight_decay: 5e-2
+optimizer_impl: adamw          # or adamw8bit: less memory, but needs experiment.training.checkpointing.save_weights_only=true
 lr_scheduler:
   name: warmup_hold_cosine
   num_warmup_steps: 150
   num_hold_steps: 999999       # with min_lr_rate 1.0: constant LR after warmup
   num_training_steps: 1000000
   min_lr_rate: 1.0
+gf_freeze_depth: true          # depth expert frozen; needs experiment.fsdp_use_orig_params
+gradient_checkpointing_rate: 0.93
+rescale_lr_on_resume: true          # resume keeps the configured LR, not the one saved in the ckpt
+rng_allow_world_size_change: true   # resuming on a different GPU count re-derives per-rank RNG
+save_startup_checkpoint: true       # save startup.ckpt before the first step
+pg_timeout_min: 180                 # process-group timeout; full-state checkpoint gathers are slow
 
-diffusion_forcing:
-  enabled: true
-  mode: ray_depth_prediction_firstlast
-  train_rgb: true
-  depth_loss_weight: 1.0
-  mask_clean_token_loss: true
-  subset_settings:
-    tartanair: [0, 1, 2, 3, 4]
-    re10k: [0, 1, 2, 3]
+logging:
+  loss_freq: 1
+  video_freq: 1000
+  video_type: grid
+  fps: ${dataset.fps}
+
+text_encoder:
+  name: google/umt5-xxl
+  ckpt_path: Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+  text_len: 512
+  text_dim: 4096
+  compile: false
+
+vae:
+  ckpt_path: Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+  compile: false
+  encoder_compile: true    # torch.compile the VAE encoder (faster training steps after a one-time compile)
+  merge_flf_chunks: true   # encode the interior chunks in one pass; same result, more memory
+  z_dim: 48
+  stride: [4, 16, 16]
+  mean: [-0.2289, -0.0052, -0.1323, -0.2339, -0.2799, 0.0174, 0.1838, 0.1557, -0.1382, 0.0542, 0.2813, 0.0891, 0.1570, -0.0098, 0.0375, -0.1825, -0.2246, -0.1207, -0.0698, 0.5109, 0.2665, -0.2108, -0.2158, 0.2502, -0.2055, -0.0322, 0.1109, 0.1567, -0.0729, 0.0899, -0.2799, -0.1230, -0.0313, -0.1649, 0.0117, 0.0723, -0.2839, -0.2083, -0.0520, 0.3748, 0.0152, 0.1957, 0.1433, -0.2944, 0.3573, -0.0548, -0.1681, -0.0667]
+  std: [0.4765, 1.0364, 0.4514, 1.1677, 0.5313, 0.4990, 0.4818, 0.5013, 0.8158, 1.0344, 0.5894, 1.0901, 0.6885, 0.6165, 0.8454, 0.4978, 0.5759, 0.3523, 0.7135, 0.6804, 0.5833, 1.4146, 0.8986, 0.5659, 0.7069, 0.5338, 0.4889, 0.4917, 0.4069, 0.4999, 0.6866, 0.4093, 0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887, 0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744]
+
+model:
+  ckpt_path: Wan-AI/Wan2.2-TI2V-5B
+  # Release weights (weights-only warm start; see configure_model). Either a local
+  # .safetensors/.ckpt file or <hf_user>/<hf_repo>/<file>, downloaded to $HF_HOME on first use.
+  tuned_ckpt_path: amanim71/UGG/ugg_release.safetensors
+  compile: false
+  model_type: t2v
+  patch_size: [1, 2, 2]
+  in_dim: ${algorithm.vae.z_dim}
+  out_dim: ${algorithm.vae.z_dim}
+  dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  num_heads: 24
+  num_layers: 30
+  window_size: [-1, -1]
+  qk_norm: true
+  cross_attn_norm: true
+  eps: 1e-6
+  # Keep only the first N transformer blocks. Smoke tests only; null = full model.
+  debug_num_layers: null

@@ -89,8 +89,6 @@ class OmniWorldGameDataset(VideoDataset):
             split_info = json.load(f)
         record["frame_indices"] = split_info["split"][split_idx]
 
-        # if not record.get("caption"):
-        #     record["caption"] = self._find_caption(scene_dir, record["frame_indices"])
 
         return record
 
@@ -183,8 +181,8 @@ class OmniWorldGameDataset(VideoDataset):
         both streams well-conditioned: near-stationary clips get a stable scene
         anchor, and high-motion clips are unaffected because |M| dominates.
 
-        Note: unlike PointOdyssey we deliberately avoid a depth-median floor.
-        OmniWorld-Game depths can be huge (sky-box, long corridors) and a
+        A depth-median floor is deliberately avoided: OmniWorld-Game depths can be huge
+        (sky-box, long corridors) and a
         large depth median would divide moments down until they are ~0 — no
         raymap signal left for the model to learn from.
 
@@ -193,7 +191,7 @@ class OmniWorldGameDataset(VideoDataset):
         moments = raymaps_raw[:, 3:6]
 
         if is_scale_norm_mode(self.cfg):
-            # Scheme C (SCALE_NORMALIZATION_ANALYSIS.md): per-clip s = kappa*median(valid depth).
+            # scale_mode=parallax: per-clip s = kappa*median(valid depth).
             # OmniWorld units are game-engine-arbitrary, but parallax (moments/depth) is
             # dimensionless so the scheme still applies; median is robust to skybox outliers.
             return apply_scale_norm(raymaps_raw, depth_metric, self.cfg, INVALID_DEPTH_SENTINEL)
@@ -203,13 +201,9 @@ class OmniWorldGameDataset(VideoDataset):
             # and the mapping is invertible (x mutual_scale -> metres). Matches tartanair.
             scale = float(self.cfg.get("mutual_scale", None) or GLOBAL_SCALE)
         elif self.cfg.get("depth_only", False):
-            # depth_only discards the camera downstream (has_raymap=False, ray tokens
-            # noise-filled and loss-masked), so there is no moment channel left to keep
-            # well-conditioned and no depth<->pose alignment to preserve -- the two
-            # reasons the MIN_SCALE floor exists. Gauging depth on camera motion is then
-            # meaningless: OmniWorld's |M| is ~0.02 of range, so MIN_SCALE always binds
-            # and the depth channel collapses into the top of [-1,1] (measured: 42% of
-            # clips crushed, range used 0.415 median, 0.014 worst). Gauge on the scene.
+            # depth_only drops the cameras downstream, so there is no depth<->pose alignment to
+            # preserve; gauge depth on the clip's own median depth (the near-static cameras would
+            # otherwise crush the depth channel).
             valid = (depth_metric > 0) & (depth_metric < INVALID_DEPTH_SENTINEL)
             zbar = float(depth_metric[valid].median().item()) if bool(valid.any()) else 0.0
             scale = zbar if zbar > 1e-8 else 1.0
@@ -364,11 +358,8 @@ class OmniWorldGameDataset(VideoDataset):
         frame_indices = np.asarray(record["frame_indices"])
         n_split_frames = len(frame_indices)
         fps = record["fps"]
-        # import ipdb; ipdb.set_trace()
 
         temporal_indices = self._temporal_sample(n_split_frames, fps)
-        # if not getattr(self.cfg, "no_augmentations", False) and random.random() < 0.5:
-        #     temporal_indices = temporal_indices[::-1].copy()
 
         global_ids = np.asarray([frame_indices[int(i)] for i in temporal_indices])
 
@@ -387,8 +378,7 @@ class OmniWorldGameDataset(VideoDataset):
         K_list, r_list, t_list = self._load_cameras(record, temporal_indices)
 
         # --- Aspect-preserving center-crop + resize to (self.height, self.width) ---
-        # Same pattern as vkitti2/point_odyssey/scannetpp: one crop applies to
-        # RGB, depth, mask, and K so raymaps below are geometrically valid.
+        # One crop applies to RGB, depth, mask and K, so the raymaps below are geometrically valid.
         H_src, W_src = frames.shape[-2:]
         box = center_crop_box_for_aspect(H_src, W_src, self.height, self.width)
         frames = apply_spatial_crop(frames, box)
@@ -400,7 +390,6 @@ class OmniWorldGameDataset(VideoDataset):
                             mode="nearest")  # nearest, NOT bilinear: bilinear mixes the 0-stuffed
                             # invalid pixels into valid depths at mask boundaries and creates
                             # flying-pixel depths at object edges (mask is nearest -> misaligned).
-                            # Matches tartanair/spring/bedlam/ase/mvs_synth/matrixcity/mid_air.
         v = F.interpolate(v.float(), size=(self.height, self.width),
                           mode="nearest").bool()
         frames = self.img_normalize(frames)
@@ -426,10 +415,7 @@ class OmniWorldGameDataset(VideoDataset):
         return frames, raymaps, depths, scale, ext_gt, K_gt, depths_raw, depths_valid
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion): recursive retries pin each level's
-        # partially-decoded tensors via the exception traceback; with many failing
-        # records (e.g. bedlam2's misnamed depth files) DataLoader workers ballooned
-        # to ~100GB and were OOM-killed, silently losing the sample.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -439,8 +425,7 @@ class OmniWorldGameDataset(VideoDataset):
                 scene_id = record.get("scene_id", str(idx))
                 split_idx = record.get("split_idx", "?")
                 print(f"Warning: skipping {scene_id}/split_{split_idx}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
@@ -454,12 +439,8 @@ class OmniWorldGameDataset(VideoDataset):
             "has_caption": bool(record.get("caption", "")),
         }
 
-        # Use the caption cache when configured. `_select_caption` returns
-        # (caption, ABSOLUTE prompt-embed path) for this scene, picking a random
-        # caption variant per __getitem__. Previously this loader read only
-        # record["caption"] and its _load_prompt_embed returned a ZERO tensor, so a
-        # configured caption_cache_dir was silently ignored and every clip trained
-        # with a null text embedding.
+        # Use the caption cache when configured: `_select_caption` returns (caption, absolute
+        # prompt-embed path), picking a random caption variant per call.
         _cap = self._select_caption(record)
         _embed_override = None
         if _cap is not None:
@@ -468,10 +449,7 @@ class OmniWorldGameDataset(VideoDataset):
             _caption = record.get("caption", "")
         prompts = self.id_token + _caption
         prompt_embeds, prompt_embed_len = None, None
-        # A cache miss is NOT a reason to drop the sample. `_load_prompt_embed_or_null`
-        # falls back to the null embedding (what this subset trained on before captions
-        # were wired up) instead of raising into MixtureDataset's except/continue, which
-        # would make every uncaptioned scene unreachable.
+        # A cache miss falls back to the null embedding rather than dropping the sample.
         _has_caption = _embed_override is not None or bool(_caption)
         if self.load_prompt_embed:
             (
@@ -481,8 +459,7 @@ class OmniWorldGameDataset(VideoDataset):
             ) = self._load_prompt_embed_or_null(
                 record, path_override=_embed_override
             )
-        # Keep the metadata honest: a cache hit means this clip really does have a
-        # caption, regardless of what record["caption"] said at index time.
+        # A cache hit means this clip has a caption, whatever record["caption"] says.
         video_metadata["has_caption"] = _has_caption
 
         record["height"] = video_metadata["height"]
@@ -504,11 +481,8 @@ class OmniWorldGameDataset(VideoDataset):
             "prompts": prompts,
         }
         if self.cfg.get("depth_only", False):
-            # Treat OmniWorld as an RGB+depth-ONLY dataset: omit the camera keys so
-            # MixtureDataset injects has_raymap=False -> the algorithm noise-fills and
-            # loss-masks all ray tokens. With diffusion-forcing setting [1] the training
-            # objective is then exactly RGB history -> depth future (no pose, no NVS).
-            # Cameras are still used INTERNALLY above only to normalize depth's scale.
+            # RGB + depth only: omit the camera keys so MixtureDataset sets has_raymap=False and the
+            # algorithm noise-fills and loss-masks the ray tokens.
             for k in ("raymaps", "raymap_scale", "extrinsics_gt", "intrinsics_gt"):
                 output.pop(k)
         if prompt_embeds is not None:

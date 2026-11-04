@@ -4,14 +4,6 @@ from torch.utils.data import IterableDataset, Dataset, get_worker_info
 from omegaconf import DictConfig, open_dict
 import torch
 import numpy as np
-# from datasets.openx_base import OpenXVideoDataset
-# from datasets.droid import DroidVideoDataset
-# from datasets.something_something import SomethingSomethingDataset
-# from datasets.epic_kitchen import EpicKitchenDataset
-# from datasets.pandas import PandasVideoDataset
-# from datasets.deprecated.video_1x_wm import WorldModel1XDataset
-# from datasets.ego4d import Ego4DVideoDataset
-# from datasets.aria import AriaDataset
 from datasets.dl3dv_colmap import DL3DVColmapDataset
 from datasets.mid_air import MidAirDataset
 from datasets.mvs_synth import MVSSynthDataset
@@ -27,52 +19,19 @@ from datasets.bedlam import BedlamDataset
 from datasets.ase import ASEDataset
 
 subset_classes = dict(
-    # something_something=SomethingSomethingDataset,
-    # epic_kitchen=EpicKitchenDataset,
-    # pandas=PandasVideoDataset,
-    # video_1x_wm=WorldModel1XDataset,
-    # ego4d=Ego4DVideoDataset,
-    # droid=DroidVideoDataset,
-    # austin_buds=OpenXVideoDataset,
-    # austin_sailor=OpenXVideoDataset,
-    # austin_sirius=OpenXVideoDataset,
-    # bc_z=OpenXVideoDataset,
-    # berkeley_autolab=OpenXVideoDataset,
-    # berkeley_cable=OpenXVideoDataset,
-    # berkeley_fanuc=OpenXVideoDataset,
-    # bridge=OpenXVideoDataset,
-    # cmu_stretch=OpenXVideoDataset,
-    # dlr_edan=OpenXVideoDataset,
-    # dobbe=OpenXVideoDataset,
-    # fmb=OpenXVideoDataset,
-    # fractal=OpenXVideoDataset,
-    # iamlab_cmu=OpenXVideoDataset,
-    # jaco_play=OpenXVideoDataset,
-    # language_table=OpenXVideoDataset,
-    # nyu_franka=OpenXVideoDataset,
-    # roboturk=OpenXVideoDataset,
-    # stanford_hydra=OpenXVideoDataset,
-    # taco_play=OpenXVideoDataset,
-    # toto=OpenXVideoDataset,
-    # ucsd_kitchen=OpenXVideoDataset,
-    # utaustin_mutex=OpenXVideoDataset,
-    # viola=OpenXVideoDataset,
-    
-    # --- 3D video datasets ---
-    # aria=AriaDataset,
-    dl3dv_colmap=DL3DVColmapDataset,  # original COLMAP poses, NVS-only (no depth)
+    dl3dv_colmap=DL3DVColmapDataset,  # COLMAP poses, NVS only (no depth)
     mid_air=MidAirDataset,
     mvs_synth=MVSSynthDataset,
     matrixcity=MatrixCityDataset,
     omniworld_game=OmniWorldGameDataset,
     re10k=RE10KDataset,
-    scenenet=SceneNetRGBDDataset,   # camera-aware SceneNet (real GT poses), used in mixture_parallax14
+    scenenet=SceneNetRGBDDataset,   # SceneNet RGB-D with ground-truth poses
     vkitti2=VirtualKitti2Dataset,
     tartanair=TartanAirDataset,
     tartanair_v2=TartanAirV2Dataset,
     spring=SpringDataset,
     bedlam=BedlamDataset,
-    bedlam2=BedlamDataset,        # BEDLAM v2 tree (separate data_root); same loader (handles v1+v2 layout)
+    bedlam2=BedlamDataset,        # BEDLAM v2 (separate data_root, same loader)
     ase=ASEDataset,
 )
 
@@ -92,11 +51,8 @@ class MixtureDataset(IterableDataset):
             if split in ["training", "train"]
             else int(np.random.get_state()[1][0])
         )
-        # Optional deterministic seed for cross-run comparability (dataset.mixture_seed).
-        # The time seed above differs per rank because each rank constructs its own
-        # dataset; a naive shared constant would make every rank yield the SAME stream
-        # (32 duplicated batches per step). Mix the rank in with a stride larger than
-        # any num_workers so (rank, worker) pairs stay disjoint in _build_iteration_rng.
+        # Optional fixed seed (dataset.mixture_seed). Each rank builds its own dataset, so the rank
+        # is mixed in (stride larger than any num_workers) to keep (rank, worker) streams distinct.
         _cfg_seed = self.cfg.get("mixture_seed", None)
         if _cfg_seed is not None and split in ["training", "train"]:
             import os as _os
@@ -121,22 +77,17 @@ class MixtureDataset(IterableDataset):
             subset_cfg["height"] = self.cfg.height
             subset_cfg["width"] = self.cfg.width
             subset_cfg["n_frames"] = self.cfg.n_frames
-            # Do NOT override cfg.fps — each subset's yaml carries its own
-            # calibrated fps so per-frame motion magnitude is comparable across
-            # datasets (see datasets/geometry_verification/all/tune_fps.py).
-            # The mixture's top-level `fps:` is just a playback/reference rate.
+            # Keep each subset's own fps (chosen so per-frame motion is comparable across
+            # datasets); the mixture's top-level fps is only a fallback.
             if "fps" not in subset_cfg:
                 subset_cfg["fps"] = self.cfg.fps
             subset_cfg["load_video_latent"] = self.cfg.load_video_latent
             subset_cfg["load_prompt_embed"] = self.cfg.load_prompt_embed
             subset_cfg["max_text_tokens"] = self.cfg.max_text_tokens
             subset_cfg["image_to_video"] = self.cfg.image_to_video
-            # scale_preserving / scale_mode / parallax_kappa are not pre-declared in the
-            # subset yamls, so open_dict to bypass struct-mode key check. scale_mode=parallax
-            # is scheme C (SCALE_NORMALIZATION_ANALYSIS.md); propagated to every subset so a
-            # single top-level dataset.scale_mode=parallax switches the whole mixture. NVS
-            # subsets without metric depth (re10k, dl3dv_colmap) ignore it and keep per-clip
-            # moment normalization.
+            # Propagate the scale settings to every subset (open_dict: they are not declared in
+            # the subset yamls). NVS subsets without metric depth (re10k, dl3dv_colmap) ignore
+            # scale_mode and keep per-clip moment normalization.
             with open_dict(subset_cfg):
                 subset_cfg["scale_preserving"] = self.cfg.get("scale_preserving", False)
                 subset_cfg["scale_mode"] = self.cfg.get("scale_mode", None)
@@ -145,23 +96,14 @@ class MixtureDataset(IterableDataset):
                 subset_cfg["parallax_log_alpha"] = self.cfg.get("parallax_log_alpha", None)
                 subset_cfg["parallax_ray_encoding"] = self.cfg.get("parallax_ray_encoding", None)
                 subset_cfg["parallax_mu"] = self.cfg.get("parallax_mu", None)
-                # G3: the metric depth-gauge table that lets the pose-only NVS subsets
-                # (re10k, dl3dv_colmap) compute the SAME s = kappa*median(depth) gauge as
-                # the geometry loaders. Without it they silently fall back to per-clip
-                # max-norm and the mixture carries two incompatible moment codes at once.
+                # Depth-gauge table that lets the NVS subsets (re10k, dl3dv_colmap) use the same
+                # s = kappa * median(depth) gauge as the geometry loaders.
                 subset_cfg["parallax_gauge_file"] = self.cfg.get("parallax_gauge_file", None)
-                # Per-subset alpha override for the indoor/outdoor alpha arms (GalphaIO).
-                # The block above sets ONE alpha for every subset; this lets a named subset
-                # carry its own. Alpha is consumed only by the depth-channel encode
-                # (_scale_norm._log_depth), so it is a no-op for the depth-less NVS subsets.
-                # Inert unless `parallax_log_alpha_by_subset` is set, so every other run is
-                # bit-identical to before this change. Same block the 1.3B GalphaIO arm
-                # trained with.
+                # Optional per-subset override of parallax_log_alpha (no-op for depth-less subsets).
                 _by_sub = self.cfg.get("parallax_log_alpha_by_subset", None)
                 if _by_sub is not None and subset_name in _by_sub:
                     subset_cfg["parallax_log_alpha"] = float(_by_sub[subset_name])
-            # Only override raymap_{h,w} on subsets that already declare them
-            # (e.g. scenenet_depth has no raymap generation and lacks these keys).
+            # Only override raymap_{h,w} on subsets that declare them.
             if "raymap_height" in self.cfg and "raymap_height" in subset_cfg:
                 subset_cfg["raymap_height"] = self.cfg.raymap_height
             if "raymap_width" in self.cfg and "raymap_width" in subset_cfg:
@@ -286,10 +228,8 @@ class MixtureDataset(IterableDataset):
         the BOUND, i.e. on len(dataset) for the selected subset. Picking the wrong
         subset here would desynchronise the stream.
 
-        Not reproduced: the `except` path, which consumes both draws and yields
-        nothing. Measured over a full run -- 25 failures in 8.9M samples (2.8e-6) --
-        so across 1120 (rank, worker) streams almost every stream has zero, and an
-        affected one is off by a single sample in ~1620.
+        Not reproduced: the `except` path, which consumes both draws and yields nothing.
+        Load failures are rare, so this is off by at most a few samples.
         """
         for _ in range(int(n)):
             rand = rng.random()
@@ -306,8 +246,7 @@ class MixtureDataset(IterableDataset):
 
     def __iter__(self):
         rng = self._build_iteration_rng()
-        # Default 0 -> byte-for-byte the previous behaviour. Only a deliberate
-        # dataset.stream_skip_iters= override can change the stream.
+        # Optional: skip the first stream_skip_iters iterations (default 0).
         _skip = self.cfg.get("stream_skip_iters", 0) or 0
         if _skip:
             w = get_worker_info()

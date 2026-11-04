@@ -18,11 +18,11 @@ num_frames: 50           # clip length when no video gives it (image without cam
 output_dir: outputs/infer
 mode: dense              # task=video only. dense: every frame is given | sparse: only the first and last
 prompt: null             # optional caption; loads the T5 text encoder (~11 GB) on first use
-seed: 0                  # protocol seed for depth/pose (the NVS harness uses 42)
+seed: 0                  # sampling seed
 max_frames: 50           # clip length cap; the used length is the largest M <= cap with M % 4 == 2
 frame_mode: contig_first # contig_first (the protocol) | uniform (spread over the whole video)
 shared_intrinsics: true  # fit one K per clip when recovering cameras (recommended)
-percentile_clip: 2.0     # disparity floor for depth decoding; 10 measured better outdoors
+percentile_clip: 2.0     # disparity floor (percentile) for depth decoding; ~10 suits outdoor scenes
 dit_bf16: true           # run the DiT in bf16
 device: cuda
 

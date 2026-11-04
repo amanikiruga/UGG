@@ -1,20 +1,19 @@
 """Shared, opt-in caption + prompt-embedding cache lookup for the geometry
 datasets.
 
-The captioning pipeline (video_4d_dataset) writes, per dataset,
+The captioning pipeline writes, per dataset,
     <cache_dir>/captions.csv                      (split,scene_id[,variant,...],frame_indices,caption)
     <cache_dir>/prompt_embeds/<key>.pt            (raw bf16 [seq,4096] UMT5-XXL)
 where <key> = the row's identifying columns (everything except
-frame_indices/caption) joined by "__" with "/" and whitespace sanitized —
-IDENTICAL to scripts/cache_prompt_embeds.py. This module reconstructs that
+frame_indices/caption) joined by "__" with "/" and whitespace sanitized. This module
+reconstructs that
 mapping so a loader can, per record, attach a real caption and an ABSOLUTE
 prompt_embed_path (video_base._load_prompt_embed resolves data_root/<path>;
 an absolute path passes through unchanged).
 
 A dataset opts in by setting cfg.caption_cache_dir; a loader then calls
 `cache.attach(record, scene_id)` in preprocess_record. Multiple caption
-"variants" (distinct Gemini seeds) per scene are chosen at random each call
-for text augmentation. Default off → zero behaviour change for existing runs.
+"variants" per scene are chosen at random each call for text augmentation. Off by default.
 """
 from __future__ import annotations
 

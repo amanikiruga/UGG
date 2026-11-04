@@ -45,8 +45,7 @@ def run_local(cfg: DictConfig):
     output_dir = Path(hydra_cfg.runtime.output_dir)
     if is_rank_zero:
         print(cyan(f"Outputs will be saved to:"), output_dir)
-        # latest-run is shared across concurrent jobs (A/B pairs boot simultaneously);
-        # losing the unlink->symlink race must not kill the rank.
+        # latest-run may be shared by concurrent jobs; losing the unlink->symlink race is harmless.
         try:
             (output_dir.parents[1] / "latest-run").unlink(missing_ok=True)
             (output_dir.parents[1] / "latest-run").symlink_to(

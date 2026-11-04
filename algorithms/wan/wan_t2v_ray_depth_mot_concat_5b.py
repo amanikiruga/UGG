@@ -1,5 +1,9 @@
 import logging
 import gc
+import io
+import os
+from datetime import timedelta
+
 import torch
 import bitsandbytes as bnb
 import torch.nn.functional as F
@@ -10,14 +14,8 @@ from einops import rearrange, repeat
 from tqdm import tqdm
 from algorithms.common.base_pytorch_algo import BasePytorchAlgo
 from transformers import get_scheduler
-import zmq
-import msgpack
-import io
-import os
 from huggingface_hub import hf_hub_download
 from PIL import Image
-import torchvision.transforms as transforms
-from utils.video_utils import numpy_to_mp4_bytes
 from utils.training_correctness import (
     collect_all_rank_rng_states,
     masked_flow_mse,
@@ -34,11 +32,7 @@ from .modules.model_ray_depth_mot_concat_5b import WanModel, WanAttentionBlock
 from .modules.model import WanModel as BaseWanModel
 from .modules.t5 import umt5_xxl, T5CrossAttention, T5SelfAttention
 from .modules.tokenizers import HuggingfaceTokenizer
-from .modules.vae import video_vae_factory
-from .modules.vae_v2 import (
-    video_vae_factory as video_vae_factory_v2,
-    video_vae_flf_factory_v2,
-)
+from .modules.vae_v2 import video_vae_flf_factory_v2
 from .utils.fm_solvers import (
     FlowDPMSolverMultistepScheduler,
     get_sampling_sigmas,
@@ -49,16 +43,14 @@ from utils.distributed_utils import is_rank_zero
 from datasets.re10k import raymap_to_camera
 
 
+# ---- validation metrics and visualizations ---------------------------------------------
+
 def _depth_to_colormap(depth: torch.Tensor, ref: torch.Tensor = None) -> torch.Tensor:
-    """Apply turbo colormap to depth/disparity. depth: [B, T, C, H, W] -> [B, T, 3, H, W] in [0, 1].
-    Per-sample min-max normalized over the whole clip so the colormap stretches the actual range
-    (raw disparity values cluster in a narrow band and are visually flat without this). When `ref`
-    is given, its per-sample min/max is used to normalize `depth` — pass GT as `ref` for both pred
-    and GT to keep them on the same scale side-by-side."""
+    """Turbo colormap of depth. depth: [B, T, C, H, W] -> [B, T, 3, H, W] in [0, 1].
+    Min-max normalized per sample over the clip; pass `ref` (e.g. GT) to share its range."""
     cmap = plt.get_cmap("turbo")
     B, T = depth.shape[:2]
-    # collapse channels to 1 (handles both 1-ch GT and 3-ch VAE-decoded pred)
-    d = depth.mean(dim=2, keepdim=True)  # [B, T, 1, H, W]
+    d = depth.mean(dim=2, keepdim=True)  # 1-ch GT and 3-ch VAE-decoded predictions alike
     src = ref.mean(dim=2, keepdim=True) if ref is not None else d
     src_flat = src.reshape(B, -1).float()
     d_min = src_flat.amin(dim=1).view(B, 1, 1, 1, 1)
@@ -70,8 +62,7 @@ def _depth_to_colormap(depth: torch.Tensor, ref: torch.Tensor = None) -> torch.T
 
 
 def _psnr_batch(pred: torch.Tensor, gt: torch.Tensor, skip_first_last: bool = True) -> float:
-    """pred, gt: [B, T, 3, H, W] in [-1,1]. Returns mean PSNR over interior generated frames."""
-    import math
+    """pred, gt: [B, T, 3, H, W] in [-1,1]. Mean PSNR over the interior (generated) frames."""
     pred_u = (pred * 0.5 + 0.5).clamp(0, 1).float()
     gt_u   = (gt   * 0.5 + 0.5).clamp(0, 1).float()
     if skip_first_last and pred_u.shape[1] > 2:
@@ -83,10 +74,9 @@ def _psnr_batch(pred: torch.Tensor, gt: torch.Tensor, skip_first_last: bool = Tr
 
 
 def _depth_delta_batch(pred_depth: torch.Tensor, gt_depth: torch.Tensor) -> dict:
-    """
-    pred_depth: [B, T, 3, H, W] in [-1,1] (3-ch VAE decoded)
-    gt_depth:   [B, T, 1, H, W] in [-1,1]
-    Returns delta1/2/3 after per-sample least-squares scale+shift alignment.
+    """delta1/2/3 after per-sample least-squares scale+shift alignment.
+
+    pred_depth: [B, T, 3, H, W] in [-1,1] (3-ch VAE decoded); gt_depth: [B, T, 1, H, W] in [-1,1].
     """
     B = pred_depth.shape[0]
     pred_u = (pred_depth.mean(dim=2) * 0.5 + 0.5).clamp(0, 1).float()  # [B, T, H, W]
@@ -119,7 +109,7 @@ def _depth_delta_batch(pred_depth: torch.Tensor, gt_depth: torch.Tensor) -> dict
 
 
 def _compute_relative_pose_errors(w2c_pred: np.ndarray, w2c_gt: np.ndarray) -> tuple:
-    """Returns (combined_errors, rot_errors, trans_errors) arrays."""
+    """Pairwise relative-pose errors in degrees: (max(rot, trans), rot, trans)."""
     N = len(w2c_pred)
     combined, rots, trans = [], [], []
     for i in range(N):
@@ -149,11 +139,9 @@ def _compute_auc(errors: np.ndarray, max_threshold: float, n_points: int = 1000)
 
 def _pose_metrics_batch(pred_ray_d: torch.Tensor, pred_ray_m: torch.Tensor,
                         gt_raymaps: torch.Tensor) -> dict:
-    """
-    pred_ray_d: [B, T, 3, H, W]
-    pred_ray_m: [B, T, 3, H, W]
-    gt_raymaps: [B, T, 6, H, W]
-    Returns auc3, auc30, rot_err, trans_err (mean over all pairs × batch).
+    """AUC@3/30, rotation and translation error, averaged over all frame pairs and the batch.
+
+    pred_ray_d, pred_ray_m: [B, T, 3, H, W]; gt_raymaps: [B, T, 6, H, W].
     """
     all_combined, all_rot, all_trans = [], [], []
     for b in range(pred_ray_d.shape[0]):
@@ -198,12 +186,7 @@ def _procrustes_align(source: np.ndarray, target: np.ndarray) -> np.ndarray:
 
 
 def _make_trajectory_figure(pred_raymaps: torch.Tensor, gt_raymaps: torch.Tensor) -> Image.Image:
-    """
-    Return a PIL image of the 3-D trajectory plot (pred + Procrustes-aligned GT).
-
-    pred_raymaps: [T, 6, H, W]
-    gt_raymaps:   [T, 6, H, W]
-    """
+    """3-D plot of the predicted trajectory (Procrustes-aligned) against GT. Inputs: [T, 6, H, W]."""
     try:
         _, pred_ext = raymap_to_camera(pred_raymaps.float())  # [T, 4, 4]
         _, gt_ext   = raymap_to_camera(gt_raymaps.float())    # [T, 4, 4]
@@ -245,25 +228,18 @@ def _make_trajectory_figure(pred_raymaps: torch.Tensor, gt_raymaps: torch.Tensor
 
 class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
     """
-    5B variant of WanTextToVideoRayDepthMoTConcat. Identical model/behavior, but
-    `configure_optimizers` uses bitsandbytes 8-bit AdamW (uint8 optimizer states) to
-    cut optimizer-state GPU memory ~4x (8 bytes/param -> ~2 bytes/param), so the 5B
-    model (Wan2.2-TI2V-5B + v2 VAE) fits. Routed via config name
-    `wan_t2v_ray_depth_mot_concat_5b` in experiments/exp_video.py:compatible_algorithms.
+    UGG: Wan2.2-TI2V-5B with a mixture of transformers over RGB, Pluecker raymaps and depth.
 
-    Wan T2V with Mixture-of-Transformers for RGB + Plücker raymaps + depth.
-
-    Token layout: [rgb | ray_d | ray_m | depth]
-    Stream 0 (RGB) / Stream 1 (Ray, shared for ray_d and ray_m) / Stream 2 (Depth).
+    Token layout: [rgb | ray_d | ray_m | depth], T latent frames each. The model sees three
+    expert streams: RGB, rays (ray_d and ray_m channel-concatenated into one block) and depth.
+    Diffusion forcing gives every latent frame its own noise level, so any subset of the
+    modalities can be given as clean history and the rest generated.
     """
 
     def configure_gradient_clipping(self, optimizer, gradient_clip_val=None,
                                     gradient_clip_algorithm=None):
-        """Lightning's FSDPPrecision raises MisconfigurationException on trainer-level
-        norm clipping (runs died at the first optimizer step). Bypass the
-        precision plugin: FSDP's own clip_grad_norm_ computes the TOTAL grad norm
-        across shards (incl. the hybrid-mesh process groups) and is the supported way
-        to clip under FSDP. Fallback covers non-FSDP (single-GPU debug) runs."""
+        """Clip with FSDP's own clip_grad_norm_ (total norm across shards); Lightning's
+        FSDPPrecision refuses trainer-level norm clipping."""
         if gradient_clip_val is None:
             return
         model = getattr(self.trainer.strategy, "model", None)
@@ -271,11 +247,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             norm = model.clip_grad_norm_(gradient_clip_val)
         else:
             norm = torch.nn.utils.clip_grad_norm_(self.parameters(), gradient_clip_val)
-        # clip_grad_norm_ returns the TOTAL pre-clip norm (identical on every rank —
-        # it's the global cross-shard norm), so logging it is free. Stashed here and
-        # emitted from training_step's logging block (self.log inside this hook would
-        # depend on Lightning's fx whitelist; the stash avoids that entirely).
-        self._grad_norm_last = float(norm)
+        self._grad_norm_last = float(norm)  # pre-clip global norm, logged in training_step
 
     def __init__(self, cfg):
         self.num_train_timesteps = cfg.num_train_timesteps
@@ -289,31 +261,27 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         self.lang_guidance = cfg.lang_guidance
         self.neg_prompt = cfg.neg_prompt
         self.hist_guidance = cfg.hist_guidance
-        self.sliding_hist = cfg.sliding_hist
         self.diffusion_forcing = cfg.diffusion_forcing
         self.vae_stride = cfg.vae.stride
         self.patch_size = cfg.model.patch_size
-        self.diffusion_type = cfg.diffusion_type
+
+        if not (self.diffusion_forcing.enabled
+                and self.diffusion_forcing.mode == "ray_depth_prediction_firstlast"):
+            raise ValueError("UGG requires diffusion_forcing.enabled with mode=ray_depth_prediction_firstlast")
 
         self.lat_h = self.height // self.vae_stride[1]
         self.lat_w = self.width // self.vae_stride[2]
-        
-        if self.diffusion_forcing.enabled and self.diffusion_forcing.mode == "ray_depth_prediction_firstlast":
-            if self.n_frames <= 1:
-                per_modality_t = self.n_frames
-            else:
-                interior = self.n_frames - 2
-                per_modality_t = 2 + (interior + self.vae_stride[0] - 1) // self.vae_stride[0]
-            self.lat_t = 4 * per_modality_t
+        # First-last-frame VAE: first and last frames get their own latent, the interior is
+        # compressed by vae_stride[0]. Four modality blocks of per_modality_t frames each.
+        if self.n_frames <= 1:
+            per_modality_t = self.n_frames
         else:
-            self.lat_t = 4 * (1 + (self.n_frames - 1) // self.vae_stride[0])  # rgb + ray_d + ray_m + depth
-
+            interior = self.n_frames - 2
+            per_modality_t = 2 + (interior + self.vae_stride[0] - 1) // self.vae_stride[0]
+        self.lat_t = 4 * per_modality_t
         self.lat_c = cfg.vae.z_dim
         self.max_area = self.height * self.width
-        # The model fuses ray_d + ray_m into one block, so its internal sequence
-        # spans 3 modality blocks (rgb | ray | depth), not 4 frames-per-modality.
-        # Using 4*T here would zero-pad the seq by exactly one block; the padding
-        # tokens get modality_mask=0 and are then miscounted as RGB tokens.
+        # The model fuses ray_d + ray_m into one block, so its sequence spans 3 blocks.
         self.max_tokens = (
             (3 * self.lat_t // 4)
             * (self.lat_h // self.patch_size[1])
@@ -322,12 +290,6 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
 
         self.load_prompt_embed = cfg.load_prompt_embed
         self.load_video_latent = cfg.load_video_latent
-        self.socket = None
-        if (self.sliding_hist - 1) % self.vae_stride[0] != 0:
-            raise ValueError(
-                "sliding_hist - 1 must be a multiple of vae_stride[0]. "
-                f"Got {self.sliding_hist} and vae stride {self.vae_stride[0]}"
-            )
         if self.load_video_latent:
             raise NotImplementedError("Loading video latent is not implemented yet")
         super().__init__(cfg)
@@ -340,57 +302,16 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
     def is_inference(self) -> bool:
         return self._trainer is None or not self.trainer.training
 
-    def _force_pg_timeout(self, where):
-        """Raise the default-PG NCCL timeout. Called EARLY -- see the note below.
-
-        `+experiment.pg_timeout_min` is inert (verified: the override is in the run's
-        .hydra/overrides.yaml, yet every crash logs Timeout(ms)=600000, the raw 10-minute
-        NCCL default). _set_pg_timeout is the supported way to change it on a live group.
-
-        PLACEMENT MATTERS. This was first called from on_train_start, which Lightning runs
-        AFTER the checkpoint restore AND after dataloader setup -- and that is exactly the
-        window that overruns: a run printed "Restored all
-        states" and then died on a 600 s watchdog while building dataloaders for 14 datasets
-        off a shared filesystem under heavy load from other jobs. on_train_start
-        was never reached, so the fix never applied. configure_model runs after
-        setup_environment (PG exists) and BEFORE restore/dataloaders, so it covers them.
-        """
-        try:
-            import torch.distributed as _d
-            from datetime import timedelta as _td
-            if not (_d.is_available() and _d.is_initialized()):
-                return
-            # Resolution order, most explicit first. `+experiment.pg_timeout_min` alone is
-            # NOT visible here -- self.cfg is the ALGORITHM config -- so that override was
-            # silently missing and the fallback below was doing all the work. The env var is
-            # the unambiguous channel the launcher can set.
-            #
-            # 180 min is deliberately generous. A 117 GiB full-state save gathers
-            # synchronously (a collective) before AsyncCheckpointIO backgrounds the write, and
-            # the filesystem is shared with other jobs -- we must never lose a run to a save
-            # that merely took a while. A long NCCL timeout does mean a genuinely hung job is
-            # not killed by NCCL, but arm_autoheal.sh independently treats a log frozen >40
-            # min as dead, so silent hangs stay covered.
-            import os as _os
-            _mins = 0
-            for _src in (_os.environ.get("VWM_PG_TIMEOUT_MIN"),
-                         getattr(self.cfg, "pg_timeout_min", None)):
-                try:
-                    if _src is not None and int(_src) > 0:
-                        _mins = int(_src); break
-                except Exception:
-                    pass
-            if _mins <= 0:
-                _mins = 180
-            _d.distributed_c10d._set_pg_timeout(_td(minutes=_mins), _d.group.WORLD)
-            if self.global_rank == 0:
-                print(f"[PGTIMEOUT] forced default_pg timeout to {_mins} min at {where}",
-                      flush=True)
-        except Exception as _e:
-            print(f"[PGTIMEOUT] could not force timeout at {where}: {_e!r}", flush=True)
+    def _set_pg_timeout(self):
+        """Raise the default process-group timeout (cfg.pg_timeout_min, default 180 min).
+        A full-state checkpoint gather can exceed NCCL's 10-minute default."""
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        minutes = int(self.cfg.get("pg_timeout_min", 180))
+        dist.distributed_c10d._set_pg_timeout(timedelta(minutes=minutes), dist.group.WORLD)
 
     def configure_model(self):
-        self._force_pg_timeout("configure_model")   # before restore + dataloader setup
+        self._set_pg_timeout()  # before checkpoint restore and dataloader setup
         logging.info("Building model...")
         if not self.cfg.load_prompt_embed:
             text_encoder = (
@@ -426,76 +347,34 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         vae_repo_id = os.path.dirname(self.cfg.vae.ckpt_path)
         vae_filename = os.path.basename(self.cfg.vae.ckpt_path)
         vae_model_path = hf_hub_download(repo_id=vae_repo_id, filename=vae_filename)
-        
-        is_v2 = getattr(self.cfg.vae, "version", "wan2_1") == "wan2_2"
-        is_flf = (self.diffusion_forcing.enabled and
-                  self.diffusion_forcing.mode in ("ray_prediction_firstlast", "ray_depth_prediction_firstlast"))
-        if is_v2 and is_flf:
-            vae_factory = video_vae_flf_factory_v2
-        elif is_v2:
-            vae_factory = video_vae_factory_v2
-        elif is_flf:
-            from .modules.vae import video_vae_flf_factory as vae_factory
-        else:
-            vae_factory = video_vae_factory
-
         self.vae = (
-            vae_factory(pretrained_path=vae_model_path, z_dim=self.cfg.vae.z_dim)
+            video_vae_flf_factory_v2(pretrained_path=vae_model_path, z_dim=self.cfg.vae.z_dim)
             .eval()
             .requires_grad_(False)
         ).to(self.dtype)
         self.register_buffer("vae_mean", torch.tensor(self.cfg.vae.mean, dtype=self.dtype))
         self.register_buffer("vae_inv_std", 1.0 / torch.tensor(self.cfg.vae.std, dtype=self.dtype))
         self.vae_scale = [self.vae_mean, self.vae_inv_std]
-        # The VAE and text encoder are frozen (.eval().requires_grad_(False)) and are NOT
-        # FSDP-wrapped, so they are absent from the checkpoint state_dict in BOTH
-        # state_dict_type=full and =sharded. On resume, strict loading therefore dies with
-        #   Missing key(s) in state_dict: "vae.encoder.conv1.weight", ...
-        # Non-strict loading is CORRECT here: both modules are reloaded from their
-        # pretrained files in __init__, so leaving them at those values loses nothing.
-        # The completeness check for trainable weights belongs in the launcher preflight.
+        # The frozen VAE and text encoder are not saved in checkpoints (see on_save_checkpoint)
+        # and are rebuilt from their pretrained files, so checkpoints load non-strictly.
         self.strict_loading = False
         if self.cfg.vae.compile:
             self.vae = torch.compile(self.vae)
-        if getattr(self.cfg.vae, "merge_flf_chunks", False):
-            # Feed the 12 interior 4-frame chunks as one 48-frame chunk. Mathematically
-            # the same computation (see WanVAE_FLF_v2._flf_slices_merged); it spends
-            # memory (7.8 -> 39.3 GiB on the encode) to stop launching 28 tiny encoder
-            # passes per step. Worth 2.67x on the encode by itself.
-            assert is_v2 and is_flf, "merge_flf_chunks requires the v2 FLF VAE"
+        if self.cfg.vae.merge_flf_chunks:
+            # Encode the interior 4-frame chunks in one pass; same result, more memory.
             self.vae.merge_flf_chunks = True
-        if getattr(self.cfg.vae, "encoder_compile", False):
-            # NOTE this is NOT the same as `cfg.vae.compile` above. torch.compile only
-            # traces forward(), and WanVAE_* is driven through encode()/decode(), so
-            # wrapping self.vae never reaches the conv stack -- which is why that knob
-            # measured as free and was left off. self.vae.encoder IS module-invoked, so
-            # compiling it does compile the encode path.
-            # Measured on H200, B=8, 288x384x50, both encodes per step:
-            #   eager 14 chunks 9.71s | +merge 3.64s | +compile 2.05s  (5.3x)
-            # End-to-end training step 17.5 -> 8.5 s/step (2.06x); ~145s one-time compile.
+        if self.cfg.vae.encoder_compile:
+            # The VAE runs through encode(), not forward(), so compile the encoder module itself.
             self.vae.encoder = torch.compile(self.vae.encoder, dynamic=False)
 
         if self.cfg.model.tuned_ckpt_path is not None and is_rank_zero:
-            # tuned_ckpt_path is a WEIGHTS-ONLY warm start, not a resume. It restores
-            # parameters and nothing else: the AdamW state is fresh, the LR scheduler
-            # restarts (so the 1000-step warmup re-runs) and global_step goes back to 0.
-            # For a true resume use `load=<ckpt>` / `resume=<wandb id>`, which reaches
-            # trainer.fit(ckpt_path=...) -- but that needs checkpoints saved with
-            # experiment.training.checkpointing.save_weights_only=false, otherwise there
-            # is no optimizer state in the file to restore.
             print(
-                "[WARM START] algorithm.model.tuned_ckpt_path is set -> weights only. "
-                "AdamW state reset, LR warmup will re-run, global_step restarts at 0. "
-                "This is NOT a resume; use load=<ckpt> with save_weights_only=false "
-                "for that.",
+                "[WARM START] algorithm.model.tuned_ckpt_path loads weights only: fresh optimizer, "
+                "LR warmup and global_step. To resume a run use load=<ckpt>.",
                 flush=True,
             )
 
         if self.cfg.model.tuned_ckpt_path is None:
-            # local_files_only=True: the 5B checkpoint is SHARDED (3 safetensors + index),
-            # and diffusers' shard resolver calls model_info() (a hub API call) unless this
-            # is set — which fails under HF_HUB_OFFLINE=1. The shards are fully cached, so
-            # force offline resolution. (The 1.3B single-file ckpt never hit this path.)
             self.model = WanModel.from_t2v_pretrained(
                 self.cfg.model.ckpt_path, local_files_only=True
             )
@@ -509,23 +388,12 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             )
 
             if is_mot_checkpoint:
-                # Construct on the meta device so from_config (full fp32 allocation +
-                # init_weights) costs ~0 host RAM; load_state_dict(assign=True) then
-                # materializes each parameter exactly once from the mmap'd checkpoint.
-                # Without this, every rank allocates a full ~34GB fp32 model AND loads the
-                # ~58GB ckpt on top -> the 4 ranks/node OOM'd host RAM at load (job
-                # 5355524). In a self-resume all MoT params are present, so the
-                # init_*_embedding fallbacks below don't fire; only `freqs` (a plain
-                # attribute, not in state_dict / not moved by .to()) is left on meta and
-                # is rebuilt on a real device for forward's self.freqs.to(device).
+                # Build on the meta device and materialize each parameter once from the
+                # checkpoint (assign=True), instead of allocating a full fp32 model first.
                 with torch.device("meta"):
                     self.model = WanModel.from_config(
                         WanModel._dict_from_json_file(config_path)
                     )
-                # Ordering preserved exactly as the real-device path: the bf16 cast on a
-                # meta model only sets param dtype metadata (no data), and is overwritten
-                # for every loaded key by assign=True anyway — kept here so behavior is
-                # identical for is_inference.
                 if self.is_inference:
                     self.model.to(torch.bfloat16)
                 self.model.load_state_dict(loaded_state_dict, assign=True, strict=False)
@@ -533,9 +401,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                     self.model.init_ray_embedding_from_scratch()
                 if "patch_embedding_depth.weight" not in loaded_state_dict:
                     self.model.init_depth_embedding_from_rgb()
-                # freqs is a plain attribute (not a Parameter/registered buffer): not in
-                # state_dict and not moved by .to(), so meta-init leaves it on meta.
-                # Rebuild it on a real device — same code/values as __init__ produced.
+                # freqs is a plain attribute, left on meta; rebuild it on a real device.
                 self.model.freqs = self.model._build_freqs()
             else:
                 base_model = BaseWanModel.from_config(WanModel._dict_from_json_file(config_path))
@@ -563,15 +429,9 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         if self.cfg.model.compile:
             self.model = torch.compile(self.model)
 
-        # ---- GF: freeze the DEPTH expert, train rgb/ray/pose ---------------------------
-        # MUST happen here, at the end of configure_model: Lightning's FSDPStrategy wraps
-        # the module AFTER this hook, and FSDP snapshots requires_grad at wrap time.
-        # Requires +experiment.fsdp_use_orig_params=true (mixed requires_grad per block).
-        #
-        # This does NOT make depth invariant: self-attention is unmasked over the
-        # concatenated [rgb | ray | depth] sequence, so depth queries read the rgb/ray
-        # experts' k/v and depth OUTPUTS still move as rgb/ray adapts. Freezing bounds
-        # that drift, it does not remove it -- re-measure depth on EVERY checkpoint.
+        # Freeze the depth expert and train the RGB/ray experts. Must happen here: FSDP wraps
+        # the module after this hook and snapshots requires_grad at wrap time. Needs
+        # experiment.fsdp_use_orig_params=true (mixed requires_grad within a block).
         if bool(self.cfg.get("gf_freeze_depth", False)):
             from .fg_expert import is_depth_expert, classify_gf
             names = [n for n, _ in self.model.named_parameters()]
@@ -598,17 +458,8 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         self.training_scheduler, self.training_timesteps = self.build_scheduler(True)
 
     def configure_optimizers(self):
-        # `optimizer_impl`: "adamw" (fp32, default) or "adamw8bit" (bitsandbytes).
-        #
-        # WHY fp32 IS THE DEFAULT: AdamW8bit stores heterogeneous per-state dtypes (uint8
-        # state1/state2 plus fp32 absmax/qmap), and FSDP's FULL optim-state gather asserts
-        # one dtype per parameter -- torch/distributed/fsdp/_optim_utils.py:1362
-        # `assert dtype == info.dtype` -> AssertionError at the first full-state save. So
-        # 8-bit is only usable with save_weights_only=True, which forfeits Adam state and
-        # re-runs LR warmup on every preemption -- i.e. a false resume. fp32 AdamW has
-        # homogeneous state, so full-state resume works.
-        # Cost is optimizer memory: 8 B/param = 118.6 GB, /4-way shard = 29.6 GB/GPU
-        # (vs 7.4 GB for 8-bit).
+        # "adamw" (fp32) supports full-state checkpoints. "adamw8bit" saves optimizer memory,
+        # but FSDP cannot gather its mixed-dtype state, so it needs save_weights_only=true.
         opt_impl = str(self.cfg.get("optimizer_impl", "adamw")).lower()
         if opt_impl == "adamw8bit":
             optimizer = bnb.optim.AdamW8bit(
@@ -630,12 +481,6 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             )
         print(f"[OPTIM] {opt_impl} lr={self.cfg.lr} betas={list(self.cfg.betas)} "
               f"wd={self.cfg.weight_decay}", flush=True)
-        # warmup_hold_cosine takes num_hold_steps / num_training_steps / min_lr_rate,
-        # which the generic transformers get_scheduler() rejects ("unexpected keyword
-        # argument 'num_hold_steps'"). This is the release schedule. Any other
-        # name falls through to
-        # get_scheduler unchanged, so this is inert unless warmup_hold_cosine is
-        # requested.
         scheduler_cfg = dict(self.cfg.lr_scheduler)
         scheduler_name = scheduler_cfg.pop("name")
         if scheduler_name == "warmup_hold_cosine":
@@ -653,18 +498,22 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
 
     def _load_tuned_state_dict(self, prefix="model."):
-        ckpt = torch.load(
-            self.cfg.model.tuned_ckpt_path,
-            mmap=True,
-            map_location="cpu",
-            weights_only=False,
-        )
+        path = self.cfg.model.tuned_ckpt_path
+        if not os.path.exists(path):
+            # <hf_user>/<hf_repo>/<file> on the Hugging Face Hub
+            repo_id, filename = os.path.split(path)
+            path = hf_hub_download(repo_id=repo_id, filename=filename)
+        if path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            full = load_file(path, device="cpu")
+        else:
+            full = torch.load(path, mmap=True, map_location="cpu", weights_only=False)["state_dict"]
         state_dict = {
             k[len(prefix):]: v
-            for k, v in ckpt["state_dict"].items()
+            for k, v in full.items()
             if k.startswith(prefix)
         }
-        del ckpt
+        del full
         gc.collect()
         return state_dict
 
@@ -710,14 +559,12 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     def _pack_ray_latent(self, rays):
-        "Bypass-VAE encode: spatially downsample"
+        """Rays bypass the VAE: resample to the latent grid and stack vae_stride[0] frames per
+        latent slot along channels (first/last frame repeated), zero-padded to lat_c channels.
+
+        rays: [B, T, 3, H, W] -> [B, lat_c, T_lat, lat_h, lat_w]
+        """
         B, T_in, C, H, W = rays.shape
-        # Rays bypass the VAE, so (unlike RGB/depth) they aren't auto-resampled to the
-        # latent grid. The dataset emits raymaps on the 1.3B 8x grid (e.g. 30x40); the
-        # v2 (5B) VAE latent grid is 16x (e.g. 15x20). Resample to (lat_h, lat_w) so the
-        # packed ray latent aligns spatially with the RGB latent / zero-pad block. Both
-        # the history input and the flow-matching target come from here, so this stays
-        # self-consistent; _unpack_ray_latent upsamples back to full res for viz.
         if H != self.lat_h or W != self.lat_w:
             rays = F.interpolate(
                 rays.reshape(B * T_in, C, H, W),
@@ -726,57 +573,38 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                 align_corners=False,
             ).reshape(B, T_in, C, self.lat_h, self.lat_w)
         T_lat = self.lat_t // 4
-        stride = self.vae_stride[0]  # typically 4
+        stride = self.vae_stride[0]
         r = rays
 
-        is_flf = (self.diffusion_forcing.enabled and self.diffusion_forcing.mode in ("ray_prediction_firstlast", "ray_depth_prediction_firstlast"))
-        slots = [] 
-
-        if is_flf: 
-            # this is the first frame repeated stride times. stride is 4. 
-            slots.append(torch.cat([r[:, 0]] * stride, dim=1))
-            # interior slots: stride consecutive frames each 
-            for i in range(1, T_lat - 1): 
-                # all the middle frames 
-                start = 1 + (i - 1) * stride
-                group = [r[:, min(start + j, T_in - 1)] for j in range(stride)]
-                slots.append(torch.cat(group, dim=1))
-
-            slots.append(torch.cat([r[:, -1]] * stride, dim=1))
-        else: 
-            for i in range(T_lat): 
-                group = [r[:, min(i * stride + j, T_in - 1)] for j in range(stride)]
-                slots.append(torch.cat(group, dim=1))
+        slots = [torch.cat([r[:, 0]] * stride, dim=1)]  # first frame, repeated
+        for i in range(1, T_lat - 1):  # interior: stride consecutive frames per slot
+            start = 1 + (i - 1) * stride
+            group = [r[:, min(start + j, T_in - 1)] for j in range(stride)]
+            slots.append(torch.cat(group, dim=1))
+        slots.append(torch.cat([r[:, -1]] * stride, dim=1))  # last frame, repeated
 
         packed = torch.stack(slots, dim=2)
         pad = packed.new_zeros(B, self.lat_c - stride * C, T_lat, self.lat_h, self.lat_w)
         return torch.cat([packed, pad], dim=1)
 
-    def _unpack_ray_latent(self, ray_lat, upsample_spatial=True): 
-        """Bypass-VAE decode: 
-        ray_lat: [B, lat_c, T_lat, lat_h, lat_w] eg. [B, 16, 8, 30, 40]
-        8 is the compressed temporal dimension from 26
-        returns: [B, 3, n_frames, H, W]
-        """
+    def _unpack_ray_latent(self, ray_lat, upsample_spatial=True):
+        """Inverse of _pack_ray_latent: [B, lat_c, T_lat, lat_h, lat_w] -> [B, 3, n_frames, H, W]."""
         B = ray_lat.shape[0]
         stride = self.vae_stride[0]
         C = 3
         real = ray_lat[:, :stride * C]
 
-        # [B, 4, 3, 8, 30, 40]
-        per = real.view(B, stride, C, -1, self.lat_h, self.lat_w) 
-        r = per.mean(dim=1) # [B, 3, 8, 30, 40]
-        # 
-        if upsample_spatial: 
+        per = real.view(B, stride, C, -1, self.lat_h, self.lat_w)
+        r = per.mean(dim=1)  # [B, 3, T_lat, lat_h, lat_w]
+        if upsample_spatial:
             r = rearrange(r, "b c t h w -> (b t) c h w")
             r = F.interpolate(r, size=(self.height, self.width), mode="bilinear", align_corners=False)
             r = rearrange(r, "(b t) c h w -> b c t h w ", b = B)
-        
-        # temporaly upsample to n_frames 
+
         r = F.interpolate(
-            r, 
+            r,
             size=(self.n_frames, r.shape[-2], r.shape[-1]),
-            mode="trilinear", 
+            mode="trilinear",
             align_corners=False,
         )
         return r
@@ -788,8 +616,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         depths  = batch["depths"].to(device=self.device, dtype=self.dtype, non_blocking=True)
         prompts = batch["prompts"]
 
-        # Per-sample modality presence flags from MixtureDataset._standardize_sample.
-        # Default to all-True if absent (e.g. legacy single-dataset runs).
+        # Per-sample modality presence flags (all present if the batch does not say).
         B = videos.shape[0]
         has_raymap = batch.get("has_raymap")
         has_depth  = batch.get("has_depth")
@@ -823,34 +650,26 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             prompt_embed_len = batch["prompt_embed_len"]
             prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, prompt_embed_len)]
 
-        # Encode RGB
         video_lat = self.encode_video(rearrange(videos, "b t c h w -> b c t h w"))
 
-        # Split raymaps into ray_d (ch 0-2) and ray_m (ch 3-5)
         rays_d = raymaps[:, :, :3, :, :]  # [B, T, 3, H, W]
         rays_m = raymaps[:, :, 3:, :, :]  # [B, T, 3, H, W]
-
         ray_d_lat = self._pack_ray_latent(rays_d)
         ray_m_lat = self._pack_ray_latent(rays_m)
 
-        depths_3ch = depths.repeat(1,1,3,1,1) 
+        depths_3ch = depths.repeat(1, 1, 3, 1, 1)
         depth_lat = self.encode_video(rearrange(depths_3ch, "b t c h w -> b c t h w"))
-        # done 
 
         T_lat = video_lat.shape[2]
-        # modality_mask: 0=RGB, 1=fused ray, 2=depth. Internal layout the model
-        # sees is 3*T_lat frames (ray_d and ray_m are channel-concat fused into
-        # one block right before model.forward). video_lat below keeps the 4*T
-        # layout because diffusion-forcing noise scheduling is per ray_d/ray_m.
+        # modality_mask over the model's 3 blocks: 0=RGB, 1=fused ray, 2=depth. video_lat keeps
+        # the 4-block layout because ray_d and ray_m are noised per block.
         modality_mask = torch.cat([
             torch.zeros (batch_size, T_lat,     device=self.device, dtype=torch.long),
             torch.ones  (batch_size, T_lat,     device=self.device, dtype=torch.long),
             torch.full  ((batch_size, T_lat), 2, device=self.device, dtype=torch.long),
         ], dim=1)  # [B, 3*T_lat]
 
-        # Concatenate all latents along time: [rgb | ray_d | ray_m | depth]
         video_lat = torch.cat([video_lat, ray_d_lat, ray_m_lat, depth_lat], dim=2)  # [B, C, 4*T_lat, H, W]
-        # done 
         assert video_lat.shape[2] == self.lat_t, \
             f"Expected lat_t={self.lat_t}, got {video_lat.shape[2]}"
 
@@ -862,313 +681,106 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         return batch
 
     def add_training_noise(self, video_lat, batch=None):
+        """Continuous-time flow matching with diffusion forcing over [rgb | ray_d | ray_m | depth].
+
+        Each sample draws one conditioning setting, restricted to those its subset allows
+        (diffusion_forcing.subset_settings):
+          0  first RGB history; everything else generated
+          1  all RGB history; rays and depth generated
+          2  first + last RGB and all rays history; middle RGB and depth generated
+          3  first RGB and all rays history; remaining RGB and depth generated
+          4  first RGB and all depth history; remaining RGB and rays generated
+        History frames share one noise level, set to clean with probability clean_hist_prob.
+        Returns noisy_lat, noise and t in [0, num_train_timesteps] of shape [b, f].
+        """
         b, _, f = video_lat.shape[:3]
         device = video_lat.device
-        if self.diffusion_type == "discrete":
-            video_lat = rearrange(video_lat, "b c f h w -> (b f) c h w")
-            noise = torch.randn_like(video_lat)
-            timesteps = self.num_train_timesteps
-            if self.diffusion_forcing.enabled:
-                match self.diffusion_forcing.mode:
-                    case "independent":
-                        t = np.random.randint(timesteps, size=(b, f))
-                        if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                            t[:, 0] = timesteps - 1
-                    case "rand_history":
-                        # currently we aim to support two history lengths, 1 and 6
-                        possible_hist_lengths = [1, 2, 3, 4, 5, 6]
-                        hist_length_probs = [0.5, 0.1, 0.1, 0.1, 0.1, 0.1]
-                        t = np.zeros((b, f), dtype=np.int64)
-                        for i in range(b):
-                            hist_len_idx = np.random.choice(
-                                len(possible_hist_lengths), p=hist_length_probs
-                            )
-                            hist_len = possible_hist_lengths[hist_len_idx]
-                            history_t = np.random.randint(timesteps)
-                            future_t = np.random.randint(timesteps)
-                            t[i, :hist_len] = history_t
-                            t[i, hist_len:] = future_t
-                            if (
-                                np.random.rand()
-                                < self.diffusion_forcing.clean_hist_prob
-                            ):
-                                t[i, :hist_len] = timesteps - 1
-                    case "depth_prediction": 
-                        # currently we aim to support two history lengths, 1 and 6
-                        possible_hist_lengths = [1, 4]
-                        hist_length_probs = [0.5, 0.5]
-                        t = np.zeros((b, f), dtype=np.int64)
-                        for i in range(b):
-                            hist_len_idx = np.random.choice(
-                                len(possible_hist_lengths), p=hist_length_probs
-                            )
-                            hist_len = possible_hist_lengths[hist_len_idx]
-                            history_t = np.random.randint(timesteps)
-                            future_t = np.random.randint(timesteps)
-                            t[i, :hist_len] = history_t
-                            t[i, hist_len:] = future_t
-                            if (
-                                np.random.rand()
-                                < self.diffusion_forcing.clean_hist_prob
-                            ):
-                                t[i, :hist_len] = timesteps - 1
-                t = self.training_timesteps[t.flatten()].reshape(b, f)
-                t_expanded = t.flatten()
+        noise = torch.randn_like(video_lat)  # [b, c, f, h, w]
+
+        if batch is None or "subset_id" not in batch:
+            raise KeyError("ray_depth_prediction_firstlast requires batch['subset_id']")
+        subset_settings = self.diffusion_forcing.subset_settings
+        DEFAULT_P = np.array([0.10, 0.37, 0.38, 0.10, 0.05])
+        T = f // 4  # per-modality latent frames
+        t = np.zeros((b, f), dtype=np.float32)
+        for i in range(b):
+            subset_name = batch["subset_id"][i]
+            if subset_name not in subset_settings:
+                raise KeyError(
+                    f"diffusion_forcing.subset_settings has no entry for "
+                    f"subset_id={subset_name!r}; add it to the algorithm yaml"
+                )
+            allowed = list(subset_settings[subset_name])
+            p = DEFAULT_P[allowed]
+            p = p / p.sum()
+            setting = int(np.random.choice(allowed, p=p))
+            future_t = np.random.uniform(0, 1)
+
+            if setting == 0:
+                history_t = np.random.uniform(0, 1)
+                t[i, :] = future_t
+                t[i, 0] = history_t
+                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
+                    t[i, 0] = 0
+
+            elif setting == 1:
+                history_t = np.random.uniform(0, 1)
+                t[i, :] = future_t
+                t[i, :T] = history_t
+                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
+                    t[i, :T] = 0
+
+            elif setting == 2:
+                history_t = np.random.uniform(0, 1)
+                t[i, :] = future_t
+                t[i, 0] = history_t       # first RGB
+                t[i, T - 1] = history_t   # last RGB
+                t[i, T:3*T] = history_t   # all rays (ray_d + ray_m)
+                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
+                    t[i, 0] = 0
+                    t[i, T - 1] = 0
+                    t[i, T:3*T] = 0
+
+            elif setting == 3:
+                history_t = np.random.uniform(0, 1)
+                t[i, :] = future_t
+                t[i, 0] = history_t        # first RGB
+                t[i, T:3*T] = history_t    # all rays (ray_d + ray_m)
+                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
+                    t[i, 0] = 0
+                    t[i, T:3*T] = 0
             else:
-                t = np.random.randint(timesteps, size=(b,))
-                t_expanded = repeat(t, "b -> (b f)", f=f)
-                t = self.training_timesteps[t]
-                t_expanded = self.training_timesteps[t_expanded]
+                history_t = np.random.uniform(0, 1)
+                t[i, :] = future_t
+                t[i, 0] = history_t        # first RGB
+                t[i, 3*T:] = history_t     # all depth
+                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
+                    t[i, 0] = 0
+                    t[i, 3*T:] = 0
 
-            noisy_lat = self.training_scheduler.add_noise(video_lat, noise, t_expanded)
-            noisy_lat = rearrange(noisy_lat, "(b f) c h w -> b c f h w", b=b, f=f)
-            noise = rearrange(noise, "(b f) c h w -> b c f h w", b=b, f=f)
-        elif self.diffusion_type == "continuous":
-            # continious time steps.
-            # 1. first sample t ~ U[0, 1]
-            # 2. shift t with equation: t = t * self.sample_shift / (1 + (self.sample_shift - 1) * t)
-            # 3. expand t to [b, 1/f, 1, 1, 1]
-            # 4. compute noisy_lat = video_lat * (1.0 - t_expanded) + noise * t_expanded
-            # 5. scale t to [0, num_train_timesteps]
-            # returns:
-            #  t is in [0, num_train_timesteps] of shape [b, f] or [b,], of dtype torch.float32
-            # video_lat is shape [b, c, f, h, w]
-            # noise is shape [b, c, f, h, w]
-            dist = torch.distributions.uniform.Uniform(0, 1)
-            noise = torch.randn_like(video_lat)  # [b, c, f, h, w]
+            # depth is generated in every setting except 4
+            if setting != 4:
+                t[i, 3*T:] = future_t
 
-            if self.diffusion_forcing.enabled:
-                match self.diffusion_forcing.mode:
-                    case "independent":
-                        t = dist.sample((b, f)).to(device)
-                        if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                            t[:, 0] = 0.0
-                    case "ray_prediction":
-                        # currently we aim to support two history lengths, 1 and 6
-                        possible_hist_lengths = [1, 4]
-                        hist_length_probs = [0.5, 0.5]
-                        t = np.zeros((b, f), dtype=np.float32)
-                        for i in range(b):
-                            hist_len_idx = np.random.choice(
-                                len(possible_hist_lengths), p=hist_length_probs
-                            )
-                            hist_len = possible_hist_lengths[hist_len_idx]
-                            history_t = np.random.uniform(0, 1)
-                            future_t = np.random.uniform(0, 1)
-                            t[i, :hist_len] = history_t
-                            t[i, hist_len:] = future_t
-                            if (
-                                np.random.rand()
-                                < self.diffusion_forcing.clean_hist_prob
-                            ):
-                                t[i, :hist_len] = 0
+        t = torch.from_numpy(t).to(device)
+        t = t.float()
 
+        # A modality the sample does not have is pure noise (t = 1) whatever the setting;
+        # its loss is masked in training_step.
+        has_raymap = batch.get("has_raymap")
+        has_depth  = batch.get("has_depth")
+        if has_raymap is not None:
+            missing_ray = (~has_raymap.bool()).to(device).view(b, 1).float()
+            t[:, T:3*T] = t[:, T:3*T] * (1.0 - missing_ray) + missing_ray
+        if has_depth is not None:
+            missing_depth = (~has_depth.bool()).to(device).view(b, 1).float()
+            t[:, 3*T:]   = t[:, 3*T:]   * (1.0 - missing_depth) + missing_depth
 
-                        # cast dtype of t
-                        t = torch.from_numpy(t).to(device)
-                        t = t.float()
-                    case "ray_prediction_firstlast":
-                        # 4 settings sampled uniformly:
-                        #   0  first RGB history, rest (remaining RGB + rays) future
-                        #   1  all RGB history, rays future
-                        #   2  first + last RGB history, all rays history, middle RGB future
-                        #        (matches inference_single_gpu_ray2rgb_firstlast_eval)
-                        #   3  first RGB history, all rays history, remaining RGB future
-                        #        (matches inference_single_gpu_ray2rgb_eval)
-                        T = f // 3  # per-modality latent frames
-                        t = np.zeros((b, f), dtype=np.float32)
-                        for i in range(b):
-                            # setting = np.random.choice(4, p=[0.01, 0.13, 0.13, 0.73])
-                            setting = np.random.choice(4, p=[0.22, 0.22, 0.35, 0.21])
-                            future_t = np.random.uniform(0, 1)
-
-                            if setting == 0:
-                                # first RGB frame as history, everything else future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-
-                            elif setting == 1:
-                                # all RGB frames as history, rays future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, :T] = history_t
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, :T] = 0
-
-                            elif setting == 2:
-                                # first + last RGB history, all rays history, middle RGB future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t      # first RGB
-                                t[i, T - 1] = history_t  # last RGB
-                                t[i, T:] = history_t     # all rays
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-                                    t[i, T - 1] = 0
-                                    t[i, T:] = 0
-
-                            else:  # setting == 3
-                                # first RGB history, all rays history, remaining RGB future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t   # first RGB
-                                t[i, T:] = history_t  # all rays
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-                                    t[i, T:] = 0
-
-                        t = torch.from_numpy(t).to(device)
-                        t = t.float()
-                    case "ray_depth_prediction_firstlast":
-                        # 5 settings; per-batch eligibility restricted by subset_id
-                        # (looked up in self.diffusion_forcing.subset_settings).
-                        #   0  first RGB history, rest (remaining RGB + rays + depth) future
-                        #   1  all RGB history, rays + depth future
-                        #   2  first + last RGB history, all rays history, middle RGB+depth future
-                        #   3  first RGB history, all rays history, remaining RGB+depth future
-                        #   4  first RGB history, all depth history, remaining RGB+pose future
-                        if batch is None or "subset_id" not in batch:
-                            raise KeyError(
-                                "ray_depth_prediction_firstlast requires batch['subset_id']"
-                            )
-                        subset_settings = self.diffusion_forcing.subset_settings
-                        DEFAULT_P = np.array([0.10, 0.37, 0.38, 0.10, 0.05])
-                        T = f // 4  # per-modality latent frames
-                        t = np.zeros((b, f), dtype=np.float32)
-                        for i in range(b):
-                            subset_name = batch["subset_id"][i]
-                            if subset_name not in subset_settings:
-                                raise KeyError(
-                                    f"diffusion_forcing.subset_settings has no entry for "
-                                    f"subset_id={subset_name!r}; add it to the algorithm yaml"
-                                )
-                            allowed = list(subset_settings[subset_name])
-                            p = DEFAULT_P[allowed]
-                            p = p / p.sum()
-                            setting = int(np.random.choice(allowed, p=p))
-                            future_t = np.random.uniform(0, 1)
-
-                            if setting == 0:
-                                # first RGB frame as history, everything else future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-
-                            elif setting == 1:
-                                # all RGB frames as history, rays and depth future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, :T] = history_t
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, :T] = 0
-
-                            elif setting == 2:
-                                # first + last RGB history, all rays history, middle RGB and depth future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t       # first RGB
-                                t[i, T - 1] = history_t   # last RGB
-                                t[i, T:3*T] = history_t   # all rays (ray_d + ray_m)
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-                                    t[i, T - 1] = 0
-                                    t[i, T:3*T] = 0
-
-                            elif setting == 3:  # setting == 3
-                                # first RGB history, all rays history, remaining RGB and depth future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t        # first RGB
-                                t[i, T:3*T] = history_t    # all rays (ray_d + ray_m)
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-                                    t[i, T:3*T] = 0
-                            else: 
-                                # first RGB history, all depth history, remaining RGB and pose future
-                                history_t = np.random.uniform(0, 1)
-                                t[i, :] = future_t
-                                t[i, 0] = history_t        # first RGB
-                                t[i, 3*T:] = history_t     # all depth
-                                if np.random.rand() < self.diffusion_forcing.clean_hist_prob:
-                                    t[i, 0] = 0
-                                    t[i, 3*T:] = 0
-
-                            # Depth tokens always predicted — never conditioned
-                            if setting != 4:
-                                t[i, 3*T:] = future_t
-
-                        t = torch.from_numpy(t).to(device)
-                        t = t.float()
-
-                        # Missing-modality enforcement: clamp t to 1.0 (full
-                        # noise) for raymap/depth blocks of samples whose source
-                        # subset doesn't provide that modality. This guarantees
-                        # the noisy input at those tokens is pure Gaussian
-                        # (noise * 1 + placeholder * 0), regardless of which
-                        # setting was drawn or whether the setting put that
-                        # modality in "history" or "future". Prevents the
-                        # placeholder pattern from leaking into the other
-                        # modalities' attention. The training_step's loss
-                        # masking takes care of suppressing the spurious
-                        # gradient on these tokens.
-                        if batch is not None:
-                            has_raymap = batch.get("has_raymap")
-                            has_depth  = batch.get("has_depth")
-                            if has_raymap is not None:
-                                missing_ray = (~has_raymap.bool()).to(device).view(b, 1).float()
-                                t[:, T:3*T] = t[:, T:3*T] * (1.0 - missing_ray) + missing_ray
-                            if has_depth is not None:
-                                missing_depth = (~has_depth.bool()).to(device).view(b, 1).float()
-                                t[:, 3*T:]   = t[:, 3*T:]   * (1.0 - missing_depth) + missing_depth
-                    case "rand_history":
-                        # currently we aim to support two history lengths, 1 and 6
-                        possible_hist_lengths = [1, 2, 3, 4, 5, 6]
-                        hist_length_probs = [0.5, 0.1, 0.1, 0.1, 0.1, 0.1]
-                        t = np.zeros((b, f), dtype=np.float32)
-                        for i in range(b):
-                            hist_len_idx = np.random.choice(
-                                len(possible_hist_lengths), p=hist_length_probs
-                            )
-                            hist_len = possible_hist_lengths[hist_len_idx]
-                            history_t = np.random.uniform(0, 1)
-                            future_t = np.random.uniform(0, 1)
-                            t[i, :hist_len] = history_t
-                            t[i, hist_len:] = future_t
-                            if (
-                                np.random.rand()
-                                < self.diffusion_forcing.clean_hist_prob
-                            ):
-                                t[i, :hist_len] = 0
-
-                        # cast dtype of t
-                        t = torch.from_numpy(t).to(device)
-                        t = t.float()
-                # t is [b, f] in range [0, 1] or dtype torch.float32  0 indicates clean.
-                t = t * self.sample_shift / (1 + (self.sample_shift - 1) * t)
-                t_expanded = (
-                    t.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
-                )  # [b, f] -> [b, 1, f, 1, 1]
-
-                # [b, c, f, h, w] * [b, 1, f, 1, 1] + [b, c, f, h, w] * [b, 1, f, 1, 1]
-                noisy_lat = video_lat * (1.0 - t_expanded) + noise * t_expanded
-                t = t * self.num_train_timesteps  # [b, f] -> [b, f]
-                # now t is in [0, num_train_timesteps] of shape [b, f]
-            else:
-                t = dist.sample((b,)).to(device)
-                t = t * self.sample_shift / (1 + (self.sample_shift - 1) * t)
-                t_expanded = t.view(-1, 1, 1, 1, 1)
-
-                noisy_lat = video_lat * (1.0 - t_expanded) + noise * t_expanded
-                t = t * self.num_train_timesteps  # [b,]
-                # now t is in [0, num_train_timesteps] of shape [b,]
-        else:
-            raise NotImplementedError("Unsupported time step type.")
-
+        # t in [0, 1], 0 = clean. Shift, noise, then scale to [0, num_train_timesteps].
+        t = t * self.sample_shift / (1 + (self.sample_shift - 1) * t)
+        t_expanded = t.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)  # [b, 1, f, 1, 1]
+        noisy_lat = video_lat * (1.0 - t_expanded) + noise * t_expanded
+        t = t * self.num_train_timesteps  # [b, f]
         return noisy_lat, noise, t
 
     def remove_noise(self, flow_pred, t, video_pred_lat):
@@ -1201,18 +813,16 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
 
         T = self.lat_t // 4
         video_noise_lat = noisy_lat[:, :, :T]        # RGB [B, C, T, H, W]
-        # Channel-concat ray_d and ray_m into one fused block, keeping only the real
-        # packed channels (strip the zero padding that exists in the shared latent so
-        # RGB/ray/depth share a uniform channel dim). Fused block: [B, 2*ray_ch, T, H, W]
-        ray_ch = self.vae_stride[0] * 3              # stride frames × 3 Plücker channels
+        # Fused ray block: ray_d and ray_m channel-concatenated, real channels only.
+        ray_ch = self.vae_stride[0] * 3              # stride frames x 3 Pluecker channels
         ray_noise_lat = torch.cat([
             noisy_lat[:, :ray_ch, T:2*T],
             noisy_lat[:, :ray_ch, 2*T:3*T],
         ], dim=1)
         depth_noise_lat = noisy_lat[:, :, 3*T:]      # depth [B, C, T, H, W]
 
-        # Slice t from 4T to 3T (rgb | ray_d (== ray_m in firstlast modes) | depth)
-        t_model = torch.cat([t[:, :T], t[:, T:2*T], t[:, 3*T:]], dim=1) if t.ndim == 2 else t
+        # Timesteps for the model's 3 blocks (ray_d and ray_m share a noise level).
+        t_model = torch.cat([t[:, :T], t[:, T:2*T], t[:, 3*T:]], dim=1)
 
         flow_pred = self.model(
             video_noise_lat,
@@ -1226,11 +836,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             y=image_embeds,
         )
 
-        # Split predictions and targets. Ray modalities are masked to the real
-        # packed channels [:ray_ch]; channels [ray_ch:] are the zero-pad slots
-        # (carried only so rays fit the shared lat_c-channel latent) whose flow
-        # target is pure noise — supervising them wastes capacity and dilutes the
-        # ray loss. RGB/depth are real VAE latents and use all channels.
+        # Ray losses use only the real packed channels; the zero-pad channels are not supervised.
         flow_rgb_pred   = flow_pred[:, :, :T]
         flow_ray_d_pred = flow_pred[:, :ray_ch, T:2*T]
         flow_ray_m_pred = flow_pred[:, :ray_ch, 2*T:3*T]
@@ -1240,70 +846,27 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         flow_ray_m_target = flow[:, :ray_ch, 2*T:3*T]
         flow_depth_target = flow[:, :, 3*T:]
 
-        # Clean tokens are CONTEXT, not targets. Diffusion forcing gives every token
-        # its own noise level; a token at t == 0 has noisy_lat == video_lat exactly, so
-        # its flow target (noise - video_lat) still carries the noise draw, which is
-        # unobservable from the input. Supervising it adds irreducible gradient variance
-        # -- the same reason the ray zero-pad channels are excluded just above.
-        #
-        # This is not a small effect. In setting 1 (all-RGB history -> rays+depth), a
-        # `clean_hist_prob` hit puts EVERY RGB frame at t == 0, so that sample's whole
-        # RGB term is noise, yet it still contributed 1/4 of total_loss.
-        #
-        # `t` is [B, 4T] over [rgb | ray_d | ray_m | depth]. The shared helper preserves
-        # this branch's per-sample weighting while using a global valid-sample denominator,
-        # so unequal TartanAir/RE10K composition across ranks cannot bias the gradient.
-        #
-        # Gated so the historical recipes stay bit-reproducible; see
-        # diffusion_forcing.mask_clean_token_loss in the algorithm yaml.
-        # The `t.ndim == 2` clause mirrors the same guard on t_model above: the 1-D
-        # timestep path carries no per-frame information to mask with, so it falls back
-        # to the unmasked loss instead of raising on `t[:, :T]`.
-        mask_clean = (
-            bool(self.cfg.diffusion_forcing.get("mask_clean_token_loss", True))
-            and t.ndim == 2
-        )
-
+        # Clean (t == 0) tokens are context, not targets: their flow target is unobservable noise.
+        mask_clean = bool(self.cfg.diffusion_forcing.get("mask_clean_token_loss", True))
         has_raymap = batch["has_raymap"]
         has_depth  = batch["has_depth"]
-        _t2 = t if t.ndim == 2 else None
         rgb_loss = masked_flow_mse(
-            flow_rgb_pred, flow_rgb_target,
-            timestep=None if _t2 is None else _t2[:, :T],
-            mask_clean=mask_clean,
+            flow_rgb_pred, flow_rgb_target, timestep=t[:, :T], mask_clean=mask_clean,
         )
         ray_d_loss = masked_flow_mse(
-            flow_ray_d_pred, flow_ray_d_target,
-            timestep=None if _t2 is None else _t2[:, T:2*T],
+            flow_ray_d_pred, flow_ray_d_target, timestep=t[:, T:2*T],
             available=has_raymap, mask_clean=mask_clean,
         )
         ray_m_loss = masked_flow_mse(
-            flow_ray_m_pred, flow_ray_m_target,
-            timestep=None if _t2 is None else _t2[:, 2*T:3*T],
+            flow_ray_m_pred, flow_ray_m_target, timestep=t[:, 2*T:3*T],
             available=has_raymap, mask_clean=mask_clean,
         )
         depth_loss = masked_flow_mse(
-            flow_depth_pred, flow_depth_target,
-            timestep=None if _t2 is None else _t2[:, 3*T:],
+            flow_depth_pred, flow_depth_target, timestep=t[:, 3*T:],
             available=has_depth, mask_clean=mask_clean,
         )
-        # train_rgb (default True): the RGB stream is a supervised generative modality, so its
-        # flow loss drives learning together with the geometry modalities (equal per-modality
-        # weight). Required whenever subset_settings include RGB-future settings (0/2/3/4) —
-        # otherwise the model is fed noised future RGB it is never taught to denoise.
-        # Set train_rgb=False to reproduce the old RGB->geometry-only run (RGB = clean
-        # conditioning, subset_settings=[1], no RGB gradient).
-        train_rgb = bool(self.cfg.diffusion_forcing.get("train_rgb", True))
-        # depth_loss_weight (default 1.0 == the original equal-weight mean, so every existing
-        # run and every requeue of a running job is bit-identical unless the knob is set).
-        # Raising it trades rgb/ray for depth; the denominator keeps the total on the same
-        # scale so the LR does not need re-tuning.
-        _dw = float(self.cfg.diffusion_forcing.get("depth_loss_weight", 1.0))
-        if train_rgb:
-            total_loss = (rgb_loss + ray_d_loss + ray_m_loss + _dw * depth_loss) / (3.0 + _dw)
-        else:
-            assert False, "not train_rgb is not supported"
-            total_loss = (ray_d_loss + ray_m_loss + depth_loss) / 3
+        dw = float(self.cfg.diffusion_forcing.get("depth_loss_weight", 1.0))
+        total_loss = (rgb_loss + ray_d_loss + ray_m_loss + dw * depth_loss) / (3.0 + dw)
 
         if self.global_step % self.cfg.logging.loss_freq == 0:
             self.log("train/loss_total", total_loss, sync_dist=True)
@@ -1312,27 +875,19 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             self.log("train/loss_ray_m", ray_m_loss, sync_dist=True)
             self.log("train/loss_depth", depth_loss, sync_dist=True)
             self.log("global_step", self.global_step, sync_dist=True)
-            # pre-clip global grad norm from configure_gradient_clipping (previous
-            # step's — the hook runs after this forward). Already the cross-shard
-            # total on every rank, so no sync needed; costs nothing extra.
-            gn = getattr(self, "_grad_norm_last", None)
+            gn = getattr(self, "_grad_norm_last", None)  # previous step's pre-clip norm
             if gn is not None:
                 self.log("train/grad_norm", gn, sync_dist=False)
 
         return total_loss
 
-    def on_save_checkpoint(self, checkpoint) -> None:
-        # Lightning calls this hook on every process. Gather one stochastic
-        # training state per rank so a resume does not collapse all
-        # ranks back onto the same task/noise stream.
-        checkpoint["vwm_rank_rng_states"] = collect_all_rank_rng_states()
+    # ---- checkpointing and resume --------------------------------------------------------
 
-        # The default 62GB rank-0 full-state write takes >10 min on the network FS, which stalls the
-        # other ranks' next collective past the NCCL watchdog timeout -> job crash (seen in practice
-        # at the step-1000 save). Shrink the write two ways: (1) drop the frozen text_encoder+VAE (~3GB,
-        # reconstructed from pretrained every run); (2) cast the trained model weights fp32->bf16
-        # (14.8B params: 59GB -> 30GB), halving the write to ~5 min. bf16 is fine: the model already
-        # trains in bf16-mixed and the resume path (_load_tuned_state_dict, model.* only) casts back.
+    def on_save_checkpoint(self, checkpoint) -> None:
+        # One RNG state per rank, so a resume continues each rank's own noise/task stream.
+        checkpoint["vwm_rank_rng_states"] = collect_all_rank_rng_states()
+        # Drop the frozen text encoder and VAE (rebuilt from pretrained files) and store the
+        # trained weights in bf16, halving the checkpoint.
         sd = checkpoint.get("state_dict")
         if sd is not None:
             for k in list(sd.keys()):
@@ -1352,18 +907,8 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                 flush=True,
             )
             return
-        # A DELIBERATE world-size change (32 -> 64 GPUs on 2026-09-01) makes the saved
-        # per-rank RNG states unusable: there are 32 of them and 64 ranks asking. The
-        # strict guard in select_rank_rng_state is right for an ACCIDENTAL topology
-        # change, but here it hard-fails the resume on every rank
-        # ("Checkpoint has 32 RNG states but current world_size=64").
-        #
-        # Exact stream continuation is impossible across a world-size change no matter
-        # what we do -- 64 ranks cannot inherit 32 streams. So under the explicit opt-in
-        # +algorithm.rng_allow_world_size_change=true we degrade to the SAME path used
-        # for a checkpoint that carries no RNG states at all: rank-distinct streams,
-        # seeded per rank, not main-process exact. Everything else about the resume
-        # (weights, Adam moments, LR position, global_step) is unaffected.
+        # Saved per-rank streams cannot be reused on a different number of GPUs. With
+        # rng_allow_world_size_change, fall back to fresh rank-distinct streams instead of failing.
         _ws = getattr(getattr(self, "_trainer", None), "world_size", None)
         if _ws is None and dist.is_available() and dist.is_initialized():
             _ws = dist.get_world_size()
@@ -1378,7 +923,6 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                     flush=True,
                 )
                 return
-            # No opt-in: keep the loud failure, it is a real misconfiguration signal.
         self._pending_vwm_rng_state = select_rank_rng_state(
             rank_states,
             global_rank=self.global_rank,
@@ -1386,22 +930,8 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         )
 
     def _maybe_rescale_lr_on_resume(self, checkpoint) -> None:
-        """Make ``experiment.training.lr`` authoritative across a full-state resume.
-
-        A full-state checkpoint carries the peak LR in THREE places, all of which are
-        restored verbatim and all of which outrank the config on the resume path:
-        ``optimizer_states[i].param_groups[j]["initial_lr"]`` and ``["lr"]``, and
-        ``lr_schedulers[i]["base_lrs"]`` (``LambdaLR.state_dict()`` keeps ``base_lrs``;
-        only ``lr_lambdas`` is dropped and rebuilt from config). So raising the LR to
-        follow a batch-size change -- e.g. 2e-5 @ global 512 -> 4e-5 @ global 1024 when
-        the arms went 32 -> 64 GPUs -- is SILENTLY IGNORED without this rewrite: the run
-        resumes at the old peak and nothing in the logs says so.
-
-        Opt-in, because the safe default for an ordinary crash-resume is to honour the
-        checkpoint. Enable with ``+algorithm.rescale_lr_on_resume=true``; the target is
-        ``self.cfg.lr`` (populated from ``experiment.training.lr``). The schedule SHAPE
-        (warmup/hold/total) always comes from config, since the lambda is rebuilt.
-        """
+        """With rescale_lr_on_resume, make the configured LR win over the one stored in a
+        full-state checkpoint (optimizer initial_lr/lr and scheduler base_lrs)."""
         if not bool(self.cfg.get("rescale_lr_on_resume", False)):
             return
         new_lr = float(self.cfg.lr)
@@ -1423,46 +953,17 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             flush=True,
         )
 
-    def on_train_start(self) -> None:
-        # FORCE the default-PG NCCL timeout, then report it.
-        #
-        # `+experiment.pg_timeout_min=90` is INERT. It is threaded through
-        # FSDPStrategy(timeout=) -> _init_dist_connection -> init_process_group, and
-        # init_process_group really does apply it (distributed_c10d.py:
-        # `backend_options._timeout = timeout`) -- yet every crash logs
-        #   WorkNCCL(... Timeout(ms)=600000)
-        # on PG ID 0, i.e. the raw 10-minute NCCL default. Verified inert twice: the
-        # override IS present in the run's .hydra/overrides.yaml, and the value never
-        # reaches the collective. Rather than keep chasing where Lightning drops it,
-        # set it directly on the already-initialised group with the supported API.
-        #
-        # 10 minutes is too tight for this workload: a 117 GiB full-state save flushes
-        # asynchronously while training continues, and the filesystem is shared with other
-        # jobs. A run died this way on a 1-element
-        # ALLREDUCE with no I/O error logged.
-        self._force_pg_timeout("on_train_start")
+    def _checkpoint_dir(self) -> str:
+        from lightning.pytorch.callbacks import ModelCheckpoint
+        for cb in getattr(self.trainer, "checkpoint_callbacks", []):
+            if isinstance(cb, ModelCheckpoint) and getattr(cb, "dirpath", None):
+                return cb.dirpath
+        if getattr(self.logger, "save_dir", None):
+            return os.path.join(self.logger.save_dir, "checkpoints")
+        return os.path.join(self.trainer.default_root_dir, "checkpoints")
 
-        # Report the ACTUAL default-PG NCCL timeout. `+experiment.pg_timeout_min` is
-        # threaded through FSDPStrategy(timeout=) -> _init_dist_connection ->
-        # init_process_group, but BOTH crashes on 2026-09-01 logged
-        # "WorkNCCL(... Timeout(ms)=600000)" on PG ID 0 -- the raw NCCL C++ default, not
-        # the configured 90 min and not even the code's own 30 min fallback. So the knob
-        # is suspected inert. Print the truth once instead of trusting the config echo.
-        try:
-            import torch.distributed as _d
-            if _d.is_available() and _d.is_initialized() and self.global_rank == 0:
-                _g = _d.distributed_c10d._get_default_group()
-                _t = getattr(_g, "options", None)
-                _t = getattr(_t, "_timeout", None)
-                print(f"[PGTIMEOUT] default_pg timeout = {_t} "
-                      f"(configured pg_timeout_min reaches here or it does not)", flush=True)
-        except Exception as _e:  # never let a diagnostic kill training
-            print(f"[PGTIMEOUT] probe failed: {_e!r}", flush=True)
-        # Reclaim GPU memory left fragmented by the checkpoint-load + FSDP shard. The
-        # resume path builds on meta, assigns mmap'd fp32 weights, casts to compute dtype,
-        # then FSDP flattens/shards them — leaving reserved-but-unallocated blocks that
-        # otherwise sit on top of the steady-state footprint and shrink headroom for the
-        # 24h run (and the checkpoint-save full-gather spike). Cheap and math-neutral.
+    def on_train_start(self) -> None:
+        # Release memory fragmented by checkpoint loading and FSDP sharding.
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1478,8 +979,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             rank_seed = seed_rank_training_streams(base_seed, global_rank)
             print(f"[RNG] fresh training seed={rank_seed} rank={global_rank}", flush=True)
         elif getattr(self, "_vwm_checkpoint_missing_rng", False):
-            # Older checkpoints cannot restore main-process RNG exactly, but must not revert to
-            # identical stochastic streams on every rank.
+            # No saved streams: still give every rank a distinct one.
             fallback_seed = (
                 base_seed + int(self.global_step) * 1_000_003
             ) % (2**32)
@@ -1489,66 +989,32 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                 flush=True,
             )
 
-        from lightning.pytorch.callbacks import ModelCheckpoint
-        checkpoint_dir = None
-        if hasattr(self.trainer, "checkpoint_callbacks"):
-            for cb in self.trainer.checkpoint_callbacks:
-                if isinstance(cb, ModelCheckpoint) and getattr(cb, "dirpath", None):
-                    checkpoint_dir = cb.dirpath
-                    break
-        if not checkpoint_dir:
-            if getattr(self.logger, "save_dir", None):
-                checkpoint_dir = os.path.join(self.logger.save_dir, "checkpoints")
-            else:
-                checkpoint_dir = os.path.join(self.trainer.default_root_dir, "checkpoints")
-        skip_startup_checkpoint = os.environ.get(
-            "VWM_SKIP_STARTUP_CHECKPOINT", "0"
-        ).strip().lower() in {"1", "true", "yes"}
-        # Trainer.save_checkpoint is collective under FSDP. Every rank must
-        # enter; Lightning limits filesystem writing to the correct process.
-        if self.global_step == 0 and not skip_startup_checkpoint:
+        # Save a checkpoint before the first step (collective under FSDP: every rank enters).
+        if self.global_step == 0 and self.cfg.get("save_startup_checkpoint", True):
+            checkpoint_dir = self._checkpoint_dir()
             os.makedirs(checkpoint_dir, exist_ok=True)
             self.trainer.save_checkpoint(os.path.join(checkpoint_dir, "startup.ckpt"))
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
         self.log("epoch", float(self.current_epoch), sync_dist=True)
-        from lightning.pytorch.callbacks import ModelCheckpoint
-        checkpoint_dir = None
-        if hasattr(self.trainer, "checkpoint_callbacks"):
-            for cb in self.trainer.checkpoint_callbacks:
-                if isinstance(cb, ModelCheckpoint) and getattr(cb, "dirpath", None):
-                    checkpoint_dir = cb.dirpath
-                    break
-        if not checkpoint_dir:
-            if getattr(self.logger, "save_dir", None):
-                checkpoint_dir = os.path.join(self.logger.save_dir, "checkpoints")
-            else:
-                checkpoint_dir = os.path.join(self.trainer.default_root_dir, "checkpoints")
+        checkpoint_dir = self._checkpoint_dir()
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Collective under FSDP; do not wrap this call in a rank-zero guard.
         self.trainer.save_checkpoint(
             os.path.join(checkpoint_dir, f"epoch={self.current_epoch:04d}.ckpt")
         )
 
+    # ---- sampling --------------------------------------------------------------------------
+
     @torch.no_grad()
-    def sample_seq(self, batch, hist_len=26, pbar=None, is_ray_hist=False, hist_indexes=None):
-        """
-        Denoising sampling loop for [rgb | ray_d | ray_m | depth].
+    def sample_seq(self, batch, pbar=None, hist_indexes=None):
+        """Denoise [rgb | ray_d | ray_m | depth] with the latent frames in `hist_indexes` held
+        clean (default: first and last frame of RGB and both ray blocks).
 
-        hist_len: number of pixel-space frames used as history conditioning.
+        Guidance: flow * (1 + lang + hist) - lang * flow(neg prompt) - hist * flow(history noised).
+        Returns [B, 4 * n_frames, 3, H, W].
         """
-        hist_len = min(hist_len, self.n_frames)
-        is_flf_mode = (self.diffusion_forcing.enabled and
-                       self.diffusion_forcing.mode == "ray_depth_prediction_firstlast")
-        one_frame_tokens = 2 if is_flf_mode else 1
-        if (hist_len - one_frame_tokens) % self.vae_stride[0] != 0:
-            raise ValueError(
-                f"hist_len - {one_frame_tokens} must be a multiple of vae_stride[0]. "
-                f"Got {hist_len} and vae stride {self.vae_stride[0]}"
-            )
-        hist_len = (hist_len - one_frame_tokens) // self.vae_stride[0] + one_frame_tokens  # latent-space history length
-
         self.inference_scheduler, self.inference_timesteps = self.build_scheduler(False)
         lang_guidance = self.lang_guidance if self.lang_guidance else 0
         hist_guidance = self.hist_guidance if self.hist_guidance else 0
@@ -1571,27 +1037,16 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         if pbar is None:
             pbar = tqdm(range(len(self.inference_timesteps)), desc="Sampling")
 
-        if hist_indexes is not None:
-            hist_indexes = hist_indexes  # caller-supplied
-        elif is_flf_mode:
-            # Condition on first + last frames of RGB and both ray streams; depth never conditioned
+        if hist_indexes is None:
             hist_indexes = torch.tensor([0, T - 1, T, 2*T - 1, 2*T, 3*T - 1])
-        elif not is_ray_hist:
-            hist_indexes = torch.arange(hist_len)
-        else:
-            hist_indexes = torch.cat([
-                torch.arange(T, T + hist_len),      # ray_d history frames
-                torch.arange(2*T, 2*T + hist_len),  # ray_m history frames
-            ])
 
-        ray_ch = self.vae_stride[0] * 3              # stride frames × 3 Plücker channels
+        ray_ch = self.vae_stride[0] * 3
         def _call_model(pred_lat, ctx):
             ray_lat = torch.cat([
                 pred_lat[:, :ray_ch, T:2*T],
                 pred_lat[:, :ray_ch, 2*T:3*T],
             ], dim=1)  # fused ray block, real channels only: [B, 2*ray_ch, T, H, W]
-            t_m = (torch.cat([t_expanded[:, :T], t_expanded[:, T:2*T], t_expanded[:, 3*T:]], dim=1)
-                   if t_expanded.ndim == 2 else t_expanded)
+            t_m = torch.cat([t_expanded[:, :T], t_expanded[:, T:2*T], t_expanded[:, 3*T:]], dim=1)
             return self.model(
                 pred_lat[:, :, :T],
                 ray_lat,
@@ -1605,12 +1060,9 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             )
 
         for t in self.inference_timesteps:
-            if self.diffusion_forcing.enabled:
-                video_pred_lat[:, :, hist_indexes] = video_lat[:, :, hist_indexes]
-                t_expanded = torch.full((batch_size, self.lat_t), t, device=self.device)
-                t_expanded[:, hist_indexes] = self.inference_timesteps[-1]
-            else:
-                t_expanded = torch.full((batch_size,), t, device=self.device)
+            video_pred_lat[:, :, hist_indexes] = video_lat[:, :, hist_indexes]
+            t_expanded = torch.full((batch_size, self.lat_t), t, device=self.device)
+            t_expanded[:, hist_indexes] = self.inference_timesteps[-1]
 
             flow_pred = _call_model(video_pred_lat, prompt_embeds)
 
@@ -1619,7 +1071,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             else:
                 no_lang_flow_pred = torch.zeros_like(flow_pred)
 
-            if hist_guidance and self.diffusion_forcing.enabled:
+            if hist_guidance:
                 no_hist_lat = video_pred_lat.clone()
                 no_hist_lat[:, :, hist_indexes] = torch.randn_like(no_hist_lat[:, :, hist_indexes])
                 t_expanded[:, hist_indexes] = self.inference_timesteps[0]
@@ -1633,10 +1085,8 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             video_pred_lat = self.remove_noise(flow_pred, t, video_pred_lat)
             pbar.update(1)
 
-        if self.diffusion_forcing.enabled:
-            video_pred_lat[:, :, hist_indexes] = video_lat[:, :, hist_indexes]
+        video_pred_lat[:, :, hist_indexes] = video_lat[:, :, hist_indexes]
 
-        # Decode all 4 modalities
         rgb_lat   = video_pred_lat[:, :, :T]
         ray_d_lat = video_pred_lat[:, :, T:2*T]
         ray_m_lat = video_pred_lat[:, :, 2*T:3*T]
@@ -1647,25 +1097,21 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         video_ray_m = self._unpack_ray_latent(ray_m_lat)
         video_depth = self.decode_video(depth_lat)
 
-        # Concatenate along temporal dimension: [rgb | ray_d | ray_m | depth]
         video_pred = torch.cat([video_rgb, video_ray_d, video_ray_m, video_depth], dim=2)
         video_pred = rearrange(video_pred, "b c t h w -> b t c h w")
         return video_pred
 
+    # ---- validation ------------------------------------------------------------------------
+
     def validation_step(self, batch, batch_idx=None):
         T = self.lat_t // 4
 
-        # Alternate between the two sampling tasks each validation call so
-        # total validation time is halved. All ranks do the same task so
-        # all_gather works correctly.
+        # Alternate between two tasks across validation rounds (all ranks pick the same one):
+        # RGB -> rays + depth, and first/last RGB + rays -> RGB + depth.
         val_every = self.trainer.val_check_interval if self.trainer is not None else 100
         do_rgb_to_raymap = (self.global_step // max(1, val_every)) % 2 == 0
 
-        # Reroute: raymap_to_rgb_depth requires clean ray GT to feed in as
-        # history. If the batch contains a sample without raymaps (e.g.
-        # scenenet_depth from the mixture), the raymap "history" tokens would
-        # be the randn placeholder — meaningless conditioning. Fall back to
-        # rgb_to_raymap_depth, which is always feasible (every subset has RGB).
+        # raymap -> RGB needs real rays as history; fall back if any sample has none.
         has_raymap_all = bool(batch["has_raymap"].all().item())
         has_depth_all  = bool(batch["has_depth"].all().item())
         if not do_rgb_to_raymap and not has_raymap_all:
@@ -1691,8 +1137,9 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
 
     def visualize(self, video_pred, batch, prefix="", compute_rgb_metrics=False,
                   compute_pose_metrics=False, compute_depth_metrics=False):
-        """
-        video_pred: [B, 4T, 3, H, W] — [rgb | ray_d | ray_m | depth] frames
+        """Log prediction/GT panels, metrics and trajectory plots.
+
+        video_pred: [B, 4T, 3, H, W] -- [rgb | ray_d | ray_m | depth] frames
         """
         video_gt  = batch["videos"]              # [B, T, 3, H, W]
         raymaps   = batch.get("raymaps", None)   # [B, T, 6, H, W]
@@ -1723,9 +1170,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
             vis_ray_d = pred_ray_d
             vis_ray_m = pred_ray_m
 
-        # When GT is valid, use its per-sample min/max as the shared normalization reference so
-        # pred and GT are on the same scale. Otherwise (placeholder GT or no GT) fall back to each
-        # tensor's own range so the prediction at least has a visible dynamic range.
+        # With valid GT depth, color the prediction on the GT's range; otherwise on its own.
         has_depth_t = batch.get("has_depth")
         gt_is_valid = (depth_gt is not None and has_depth_t is not None
                        and bool(has_depth_t.all().item()))
@@ -1743,7 +1188,6 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
         vis = torch.cat([vis_rgb, vis_ray_d, vis_ray_m, vis_depth], dim=-1) * 0.5 + 0.5
         vis = vis.cpu()
 
-        # gather for metrics and trajectory (keep cpu copies before gather for metrics)
         pred_rgb_cpu   = pred_rgb.cpu()
         pred_depth_cpu = pred_depth.cpu()
         video_gt_cpu   = video_gt.cpu() if isinstance(video_gt, torch.Tensor) else None
@@ -1763,12 +1207,7 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                 raymaps = rearrange(self.all_gather(raymaps.cpu()), "p b ... -> (p b) ...")
 
         if is_rank_zero:
-            # Per-subset binning: with val_bs=1, every batch contains samples
-            # from a single subset (or a list of subset_ids if val_bs>1). We
-            # log each metric twice: under `val_metrics/global/...` and under
-            # `val_metrics/<subset_id>/...`. If multiple subsets coexist in
-            # the batch, we only emit the per-subset variant when the entire
-            # batch shares one subset_id (the common val_bs=1 case).
+            # Metrics are logged globally and, when the batch comes from one subset, per subset.
             subset_ids = batch.get("subset_id")
             if isinstance(subset_ids, str):
                 subset_ids = [subset_ids]
@@ -1782,7 +1221,6 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                     logs[f"val_metrics/{unique_sid}/{prefix}{name}"] = value
                 self.logger.experiment.log(logs, step=self.global_step)
 
-            # ── Validation panel video (per-subset + global) ─────────────────────
             self.log_video(
                 f"validation_vis/global/{prefix}rgb_rayd_raym_depth",
                 vis[:16],
@@ -1797,28 +1235,21 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                     step=self.global_step,
                 )
 
-            # ── RGB quality metrics (PSNR) ─────────────────────────────────────
             if compute_rgb_metrics and video_gt_cpu is not None:
                 psnr = _psnr_batch(pred_rgb_cpu, video_gt_cpu, skip_first_last=True)
                 _log_metric("psnr", psnr)
 
-            # ── Depth metrics ──────────────────────────────────────────────────
-            # Gated on explicit flag (NOT on `depth_gt is not None`) because
-            # MixtureDataset emits randn placeholders for missing depth GT —
-            # the placeholder is not None and would silently contaminate the
-            # delta metrics. Caller passes compute_depth_metrics=has_depth.all().
+            # Gated on the flag, not on depth_gt: missing depth arrives as a placeholder tensor.
             if compute_depth_metrics and depth_gt_cpu is not None:
                 dm = _depth_delta_batch(pred_depth_cpu, depth_gt_cpu)
                 for k, v in dm.items():
                     _log_metric(k, v)
 
-            # ── Camera pose metrics ─────────────────────────────────────────────
             if compute_pose_metrics and raymaps is not None:
                 pm = _pose_metrics_batch(pred_ray_d, pred_ray_m, raymaps)
                 for k, v in pm.items():
                     _log_metric(k, v)
 
-            # ── Trajectory figure ───────────────────────────────────────────────
             if compute_pose_metrics and raymaps is not None:
                 B_traj = min(pred_ray_d.shape[0], 16)
                 traj_imgs = []
@@ -1840,75 +1271,3 @@ class WanTextToVideoRayDepthMoTConcat5B(BasePytorchAlgo):
                     if unique_sid is not None:
                         traj_logs[f"validation_viz/{unique_sid}/{prefix}trajectory"] = wandb.Image(grid_img)
                     self.logger.experiment.log(traj_logs, step=self.global_step)
-
-    def maybe_reset_socket(self):
-        if not self.socket:
-            ctx = zmq.Context()
-            socket = ctx.socket(zmq.ROUTER)
-            socket.setsockopt(zmq.ROUTER_HANDOVER, 1)
-            socket.bind(f"tcp://*:{self.cfg.serving.port}")
-            self.socket = socket
-            print(f"Server ready on port {self.cfg.serving.port}...")
-
-    @torch.no_grad()
-    def test_step(self, batch, batch_idx):
-        if is_rank_zero:
-            self.maybe_reset_socket()
-
-        print(f"Waiting for request on local rank: {dist.get_rank()}")
-        if is_rank_zero:
-            ident, payload = self.socket.recv_multipart()
-            request = msgpack.unpackb(payload, raw=False)
-            print(f"Received request with prompt: {request['prompt']}")
-            image_bytes = request["image"]
-            prompt = request["prompt"]
-            data_to_broadcast = [image_bytes, prompt]
-        else:
-            data_to_broadcast = [None, None]
-
-        dist.broadcast_object_list(data_to_broadcast, src=0)
-        image_bytes, prompt = data_to_broadcast
-        transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-                transforms.RandomResizedCrop(
-                    size=(self.height, self.width),
-                    scale=(1.0, 1.0),
-                    ratio=(self.width / self.height, self.width / self.height),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
-                ),
-            ]
-        )
-        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image = transform(pil_image)
-        batch["videos"][:, 0] = image[None]
-
-        prompt_segments = prompt.split("<sep>")
-        hist_len = 1
-        videos = batch["videos"][:, :hist_len]
-        for i, prompt in enumerate(prompt_segments):
-            print(f"Generating task {i+1} out of {len(prompt_segments)} sub-tasks")
-            batch["prompts"] = [prompt] * batch["videos"].shape[0]
-            batch["videos"][:, :hist_len] = videos[:, -hist_len:]
-            videos = torch.cat([videos, self.sample_seq(batch, hist_len)], dim=1)
-            videos = torch.clamp(videos, -1, 1)
-            hist_len = self.sliding_hist
-        videos = rearrange(self.all_gather(videos), "p b t c h w -> (p b) t h w c")
-        videos = videos.float().cpu().numpy()
-
-        if is_rank_zero:
-            videos = np.clip(videos * 0.5 + 0.5, 0, 1)
-            videos = (videos * 255).astype(np.uint8)
-            video_bytes_list = [
-                numpy_to_mp4_bytes(video, fps=self.cfg.logging.fps) for video in videos
-            ]
-            reply = {"videos": video_bytes_list}
-            self.socket.send_multipart([ident, msgpack.packb(reply)])
-            print(f"Sent reply to {ident}")
-            self.log_video(
-                "test_vis/video_pred",
-                rearrange(videos, "b t h w c -> b t c h w"),
-                fps=self.cfg.logging.fps,
-                caption="<sep>\n".join(prompt_segments),
-            )

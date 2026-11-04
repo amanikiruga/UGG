@@ -2,11 +2,9 @@ defaults:
   - video_base
   - _self_
 
-# DL3DV with the ORIGINAL COLMAP-derived poses (nerfstudio transforms.json for
-# 8K~10K, per-frame dense/cam npz for 1K~7K) instead of ViPE. NVS-ONLY subset:
-# COLMAP scale is arbitrary per scene and there is no depth, so it trains like
-# re10k — rays as history, predict RGB (diffusion_forcing settings [2, 3]).
-# 7889 usable scenes (dense 6378 + flat 1511, counted 2026-07-07).
+# DL3DV with its COLMAP poses (nerfstudio transforms.json for 8K-10K, per-frame dense/cam npz for
+# 1K-7K). NVS only: COLMAP scale is arbitrary per scene and there is no depth, so it trains like
+# re10k (rays as history, predict RGB; diffusion_forcing settings [2, 3]).
 data_root: ${data_dir}/dl3dv_colmap
 prompt_embeds_root: ${data_dir}/dl3dv_colmap_prompt_embeds
 metadata_path: ""
@@ -17,7 +15,7 @@ load_prompt_embed: true
 load_video_latent: false
 trim_mode: random_cut
 pad_mode: slowdown
-fps: 30      # 30-fps walkthroughs, sample consecutively (same as dl3dv.yaml)
+fps: 30      # 30-fps walkthroughs, sampled consecutively
 n_frames: 49
 test_percentage: 0.01
 height: 240
@@ -33,6 +31,5 @@ augmentation:
   ratio: null
   scale: null
 
-# records-manifest cache (video_base._load_records_cached): first run walks + writes
-# the JSON to the central manifest dir; every later startup loads it instantly.
+# Cached list of records, written on first run; delete it if the data changes.
 records_manifest: _records_manifest.json

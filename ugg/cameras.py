@@ -3,11 +3,9 @@
 The model outputs a 6-channel ray map per frame: Plücker direction (3) and moment (3).
 `raymap_to_camera` turns each frame's rays into intrinsics K and a camera-to-world pose by
 RANSAC/PnP on the ray field; `recover_cameras` optionally refits ONE shared intrinsic matrix
-for the whole clip (`shared_intrinsics=True`, recommended: 1.4-10x better rotation error).
+for the whole clip (`shared_intrinsics=True`, recommended: markedly lower rotation error).
 
-Vendored verbatim from the evaluation harness that produced the paper's pose tables
-(video_world_model_new/datasets/aria.py and scripts/shared_intrinsics_camera.py), so poses
-recovered here are identical to the published ones.
+This is the same recovery used for the paper's pose results.
 """
 from __future__ import annotations
 import dataclasses
@@ -19,7 +17,7 @@ from typing import Tuple
 
 from ugg._shared_intrinsics import recover_cameras_shared_intrinsics
 
-# [-1, 1] normalized Plücker moments -> raw moments (the legacy Aria normalisation constant).
+# [-1, 1] normalized Plücker moments -> raw moments (the moment normalisation constant).
 _MOMENT_ABS_MAX = max(abs(-24.74799156188965), abs(24.935894012451172))
 
 def _intersect_skew_lines(points: torch.Tensor, directions: torch.Tensor) -> torch.Tensor:
@@ -205,8 +203,8 @@ class Cameras:
 def recover_cameras(raymaps: torch.Tensor, shared_intrinsics: bool = True) -> Cameras:
     """(T, 6, h, w) predicted ray maps -> Cameras.
 
-    shared_intrinsics=False reproduces the per-frame ("legacy") recovery; True fits one K for
-    the whole clip, which is the recommended setting (the paper's `release_si` rows).
+    shared_intrinsics=False recovers K per frame; True fits one K for the whole clip, which is
+    the recommended setting.
     Camera centres are defined up to a global scale; the shared path returns them in the
     model's native ray units.
     """

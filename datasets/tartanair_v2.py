@@ -11,7 +11,7 @@ in the training pipeline. Only the on-disk layout / file IO and a couple constan
 - Depth: depth_lcam_front/{i:06d}_lcam_front_depth.png — a 4-channel uint8 PNG whose bytes
   ARE a little-endian float32 z-buffer in METRES. Decoded as cv2 does
   (`cv2.imread(..., IMREAD_UNCHANGED).view('<f4')`, i.e. BGRA byte order); we reproduce that
-  cv2-free by swapping imageio's RGBA channels to BGRA before viewing (verified identical).
+  cv2-free by swapping imageio's RGBA channels to BGRA before viewing.
   (V1 depth was plain float32 .npy.)
 - Poses:  pose_lcam_front.txt, one line per frame `tx ty tz qx qy qz qw` in the NED world
   frame (x-fwd, y-right, z-down), camera-to-world. SAME convention as V1 — converted to
@@ -50,10 +50,7 @@ K_FIXED = np.array([[FX, 0.0, CX], [0.0, FY, CY], [0.0, 0.0, 1.0]], dtype=np.flo
 FAR_PLANE_M = 1000.0                 # depth >= this is sky/far -> invalid
 INVALID_DEPTH_SENTINEL = 1.0e4       # stuffed into invalid pixels so disparity_norm -> -1
 MIN_SCALE = 1.0                      # floor for per-clip mutual scale
-# Scale-preserving global divisor for TartanAir V2 (metres). ONE fixed scale (not per-clip) divides
-# BOTH camera moments AND depth, preserving global metric scale (invertible) and metric parallax.
-# Computed from a training-set sample (scripts/tartanair_global_scale.py). [FILLED FROM P90 BELOW]
-# Shared global metric scale for TartanAir V1+V2 (see tartanair.py for the measurement). 30 m.
+# Scale-preserving global divisor (metres), shared with TartanAir V1 (see tartanair.py).
 GLOBAL_SCALE_P90 = GLOBAL_SCALE   # single source of truth (datasets/_geometry_constants.py)
 
 DIFFICULTIES = ("Data_easy", "Data_hard")
@@ -88,7 +85,7 @@ def ned_pose_to_c2w_opt(row: np.ndarray) -> np.ndarray:
 
 def _decode_depth_png(path: Path) -> np.ndarray:
     """4-channel uint8 PNG -> (H,W) float32 metres. Matches cv2 IMREAD_UNCHANGED + view('<f4').
-    imageio gives RGBA; cv2 gives BGRA, so swap ch0<->ch2 before viewing (verified identical)."""
+    imageio gives RGBA; cv2 gives BGRA, so swap ch0<->ch2 before viewing."""
     rgba = np.asarray(iio.imread(str(path)))
     bgra = rgba[..., [2, 1, 0, 3]].copy()          # RGBA -> BGRA (cv2 order)
     return bgra.view(np.float32).squeeze(-1)
@@ -258,7 +255,7 @@ class TartanAirV2Dataset(VideoDataset):
     ) -> Tuple[torch.Tensor, torch.Tensor, float]:
         moments = raymaps_raw[:, 3:6]
         if is_scale_norm_mode(self.cfg):
-            # Scheme C (SCALE_NORMALIZATION_ANALYSIS.md): per-clip s = kappa*median(valid depth).
+            # scale_mode=parallax: per-clip s = kappa*median(valid depth).
             return apply_scale_norm(raymaps_raw, depth_metric, self.cfg, INVALID_DEPTH_SENTINEL)
         elif self.cfg.get("scale_preserving", False):
             # GLOBAL fixed scale (not per-clip) -> preserves global metric scale; same scale divides
@@ -331,10 +328,7 @@ class TartanAirV2Dataset(VideoDataset):
         return frames, raymaps, depths, scale, ext_gt, K_gt, depths_raw, depths_valid
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion): recursive retries pin each level's
-        # partially-decoded tensors via the exception traceback; with many failing
-        # records (e.g. bedlam2's misnamed depth files) DataLoader workers ballooned
-        # to ~100GB and were OOM-killed, silently losing the sample.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -342,8 +336,7 @@ class TartanAirV2Dataset(VideoDataset):
                 break
             except (OSError, ValueError, KeyError, RuntimeError) as e:
                 print(f"Warning: skipping {record.get('seq_id', idx)}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
@@ -357,12 +350,8 @@ class TartanAirV2Dataset(VideoDataset):
             "has_caption": False,
         }
 
-        # Use the caption cache when configured. `_select_caption` returns
-        # (caption, ABSOLUTE prompt-embed path) for this scene, picking a random
-        # caption variant per __getitem__. Previously this loader read only
-        # record["caption"] and its _load_prompt_embed returned a ZERO tensor, so a
-        # configured caption_cache_dir was silently ignored and every clip trained
-        # with a null text embedding.
+        # Use the caption cache when configured: `_select_caption` returns (caption, absolute
+        # prompt-embed path), picking a random caption variant per call.
         _cap = self._select_caption(record)
         _embed_override = None
         if _cap is not None:
@@ -371,10 +360,7 @@ class TartanAirV2Dataset(VideoDataset):
             _caption = record.get("caption", "")
         prompts = self.id_token + _caption
         prompt_embeds, prompt_embed_len = None, None
-        # A cache miss is NOT a reason to drop the sample. `_load_prompt_embed_or_null`
-        # falls back to the null embedding (what this subset trained on before captions
-        # were wired up) instead of raising into MixtureDataset's except/continue, which
-        # would make every uncaptioned scene unreachable.
+        # A cache miss falls back to the null embedding rather than dropping the sample.
         _has_caption = _embed_override is not None or bool(_caption)
         if self.load_prompt_embed:
             (
@@ -384,8 +370,7 @@ class TartanAirV2Dataset(VideoDataset):
             ) = self._load_prompt_embed_or_null(
                 record, path_override=_embed_override
             )
-        # Keep the metadata honest: a cache hit means this clip really does have a
-        # caption, regardless of what record["caption"] said at index time.
+        # A cache hit means this clip has a caption, whatever record["caption"] says.
         video_metadata["has_caption"] = _has_caption
 
         record["height"] = video_metadata["height"]

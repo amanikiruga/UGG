@@ -887,9 +887,7 @@ class WanVAE_FLF_v2(WanVAE_):
         chunked pass reproduces a contiguous one -- which means the result does not
         depend on the chunk size. On a GPU with memory to spare we therefore feed the 12
         interior chunks as ONE chunk and keep the first/last frames separate (the FLF
-        structure). Verified exact: fp64 agreement to ~4e-15 (~20 ulp over ~30 layers),
-        the discrepancy scales with machine epsilon (fp32/fp64 ratio 5.84e8 vs eps ratio
-        5.36e8), and the causal footprint is unchanged.
+        structure). The result matches the chunked path up to floating-point rounding.
 
         The interior length MUST stay a multiple of 4: the `AvgDown3D` residual shortcut
         groups frames in non-overlapping blocks measured from the chunk start (padding
@@ -904,8 +902,8 @@ class WanVAE_FLF_v2(WanVAE_):
     def encode(self, x, scale):
         self.clear_cache()
         x = patchify(x, patch_size=2)
-        # merge_flf_chunks is set from cfg.vae.merge_flf_chunks by the algorithm.
-        # Default False keeps the historical 14-chunk path byte-for-byte.
+        # merge_flf_chunks is set from cfg.vae.merge_flf_chunks by the algorithm
+        # (default False: the chunked path).
         if getattr(self, "merge_flf_chunks", False):
             frame_slices = self._flf_slices_merged(x.shape[2])
         else:

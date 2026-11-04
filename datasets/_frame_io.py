@@ -1,9 +1,7 @@
 """Threaded per-frame reads, shared by the geometry loaders.
 
-Every loader read its 50 frames in a serial Python loop. Measured on BEDLAM PNGs, that
-runs at 53 MB/s while the same filesystem sustains ~726 MB/s under 16 threads -- a 13.8x
-speedup, because PIL/imageio/numpy all release the GIL inside the decoder. Profiling put
-these loops at 63-90% of __getitem__ for the slowest subsets.
+PIL/imageio/numpy release the GIL inside their decoders, so reading a clip's frames on a
+thread pool is much faster than a serial loop.
 
 `ex.map` preserves input order, so stacked frames stay in temporal order.
 """

@@ -8,8 +8,7 @@ load_prompt_embed: true
 load_video_latent: false
 trim_mode: random_cut
 pad_mode: slowdown
-# max_mean_adj_rotation_deg: 3.5
-fps: 8      # calibrated (tune_fps @ 50 samples; pivot)
+fps: 8      # the motion reference the other datasets' fps are matched to
 n_frames: 50
 test_percentage: 0.01
 height: 240
@@ -17,9 +16,7 @@ width: 320
 raymap_height: 30   # height // vae_stride (240 // 8)
 raymap_width: 40    # width  // vae_stride (320 // 8)
 
-# Confirmed unreadable with the training Decord path. Keeping this list in the
-# resolved config makes exclusion deterministic on every rank and auditable in
-# saved run configs, including when records use a cached manifest.
+# Videos that Decord cannot read; excluded on every rank.
 invalid_video_ids:
   - "UPOZrpkWD1U"
   - "Gp-WUXakD_Y"
@@ -32,7 +29,6 @@ invalid_video_ids:
   - "hiOS06plNYY"
 
 min_camera_travel: 0.0  # skip clips with total camera path length below this (0 = disabled)
-# min_camera_travel: 0.0  # skip clips with total camera path length below this (0 = disabled)
 
 filtering:
   disable: true  # RE10K dataset handles its own filtering
@@ -42,6 +38,5 @@ augmentation:
   ratio: null
   scale: null
 
-# records-manifest cache (video_base._load_records_cached): first run walks + writes
-# the JSON to the central manifest dir; every later startup loads it instantly.
+# Cached list of records, written on first run; delete it if the data changes.
 records_manifest: _records_manifest.json

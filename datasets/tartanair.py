@@ -9,8 +9,6 @@ Synthetic photorealistic SLAM dataset (CMU AirLab). Left camera only.
   world frame (x-forward, y-right, z-down). The quaternion is camera-to-world.
   Converted to OpenCV optical frame (x-right, y-down, z-forward) by the fixed
   permutation T (NED->cam) applied as a similarity: c2w_opt = T @ c2w_ned @ T^-1.
-  This convention is empirically verified perfect (median frame-to-frame
-  reprojection depth error ~0.1%); see datasets/geometry_verification/tartanair/.
 - Output depths: modified disparity 1/(1+d/scale) * 2 - 1 in [-1, 1] (invalid=-1).
 - Raymap moments: moments/scale clamped to [-1, 1].
 - scale = max(|raw_moments|, MIN_SCALE), MIN_SCALE = 1.0 (same as VKITTI2;
@@ -51,14 +49,8 @@ K_FIXED = np.array([[FX, 0.0, CX], [0.0, FY, CY], [0.0, 0.0, 1.0]], dtype=np.flo
 FAR_PLANE_M = 1000.0                 # depth >= this is sky/far -> invalid
 INVALID_DEPTH_SENTINEL = 1.0e4       # stuffed into invalid pixels so disparity_norm -> -1
 MIN_SCALE = 1.0                      # floor for per-clip mutual scale
-# Scale-preserving global divisor for TartanAir V1 (metres). ONE fixed scale (not per-clip) divides
-# BOTH camera moments AND depth, so global metric scale is preserved across the whole dataset (you
-# can recover metres by multiplying back) and parallax (camera/depth ratio) stays metric. Computed
-# from a sample of the training set (scripts/tartanair_global_scale.py). [FILLED FROM P90 BELOW]
-# Measured (scripts/tartanair_global_scale.py, 60 clips each): V1 depth-P90=22.1, V2 depth-P90=30.8;
-# moment-max V1=19.7, V2=29.2. Use ONE shared scale = 30 m for V1+V2 (both truly metric -> single
-# consistent metric frame; >= both moment-maxes so camera motion isn't clipped; depth disparity
-# spreads well). Recover metres by multiplying back by this constant.
+# Scale-preserving global divisor (metres): one fixed scale divides both camera moments and depth,
+# so metric scale is preserved (multiply back to recover metres) and parallax stays metric.
 GLOBAL_SCALE_P90 = GLOBAL_SCALE   # single source of truth (datasets/_geometry_constants.py)
 
 DIFFICULTIES = ("Easy", "Hard")
@@ -256,7 +248,7 @@ class TartanAirDataset(VideoDataset):
     ) -> Tuple[torch.Tensor, torch.Tensor, float]:
         moments = raymaps_raw[:, 3:6]
         if is_scale_norm_mode(self.cfg):
-            # Scheme C (SCALE_NORMALIZATION_ANALYSIS.md): s = kappa * median(valid depth),
+            # scale_mode=parallax: s = kappa * median(valid depth),
             # dividing BOTH moments and depth so moments become scene-relative parallax and
             # depth lands at a fixed operating point. Shared with every geometry loader.
             return apply_scale_norm(raymaps_raw, depth_metric, self.cfg, INVALID_DEPTH_SENTINEL)
@@ -268,13 +260,8 @@ class TartanAirDataset(VideoDataset):
         else:
             moment_max = float(moments.abs().max().item())
             if self.cfg.get("depth_only", False):
-                # depth_only drops the camera downstream (has_raymap=False, ray tokens
-                # noise-filled and loss-masked), so there is no moment channel left to
-                # condition and no depth<->pose alignment to preserve -- the two reasons
-                # MIN_SCALE exists. Gauging depth on camera motion is then meaningless.
-                # Measured on matrixcity: |m| median 1.71 against a 13.68 m scene, so
-                # depth/scale ~ 8 and 92% of clips came out crushed (range used 0.261).
-                # Gauge on the clip's own median depth instead.
+                # depth_only drops the cameras downstream, so there is no depth<->pose alignment to
+                # preserve; gauge depth on the clip's own median depth instead of camera motion.
                 valid = (depth_metric > 0) & (depth_metric < INVALID_DEPTH_SENTINEL)
                 zbar = float(depth_metric[valid].median().item()) if bool(valid.any()) else 0.0
                 scale = zbar if zbar > 1e-8 else 1.0
@@ -354,10 +341,7 @@ class TartanAirDataset(VideoDataset):
         return frames, raymaps, depths, scale, ext_gt, K_gt, depths_raw, depths_valid
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion): recursive retries pin each level's
-        # partially-decoded tensors via the exception traceback; with many failing
-        # records (e.g. bedlam2's misnamed depth files) DataLoader workers ballooned
-        # to ~100GB and were OOM-killed, silently losing the sample.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -365,8 +349,7 @@ class TartanAirDataset(VideoDataset):
                 break
             except (OSError, ValueError, KeyError, RuntimeError) as e:
                 print(f"Warning: skipping {record.get('seq_id', idx)}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
@@ -380,12 +363,8 @@ class TartanAirDataset(VideoDataset):
             "has_caption": False,
         }
 
-        # Use the caption cache when configured. `_select_caption` returns
-        # (caption, ABSOLUTE prompt-embed path) for this scene, picking a random
-        # caption variant per __getitem__. Previously this loader read only
-        # record["caption"] and its _load_prompt_embed returned a ZERO tensor, so a
-        # configured caption_cache_dir was silently ignored and every clip trained
-        # with a null text embedding.
+        # Use the caption cache when configured: `_select_caption` returns (caption, absolute
+        # prompt-embed path), picking a random caption variant per call.
         _cap = self._select_caption(record)
         _embed_override = None
         if _cap is not None:
@@ -394,10 +373,7 @@ class TartanAirDataset(VideoDataset):
             _caption = record.get("caption", "")
         prompts = self.id_token + _caption
         prompt_embeds, prompt_embed_len = None, None
-        # A cache miss is NOT a reason to drop the sample. `_load_prompt_embed_or_null`
-        # falls back to the null embedding (what this subset trained on before captions
-        # were wired up) instead of raising into MixtureDataset's except/continue, which
-        # would make every uncaptioned scene unreachable.
+        # A cache miss falls back to the null embedding rather than dropping the sample.
         _has_caption = _embed_override is not None or bool(_caption)
         if self.load_prompt_embed:
             (
@@ -407,8 +383,7 @@ class TartanAirDataset(VideoDataset):
             ) = self._load_prompt_embed_or_null(
                 record, path_override=_embed_override
             )
-        # Keep the metadata honest: a cache hit means this clip really does have a
-        # caption, regardless of what record["caption"] said at index time.
+        # A cache hit means this clip has a caption, whatever record["caption"] says.
         video_metadata["has_caption"] = _has_caption
 
         record["height"] = video_metadata["height"]
@@ -430,10 +405,8 @@ class TartanAirDataset(VideoDataset):
             "prompts": prompts,
         }
         if self.cfg.get("depth_only", False):
-            # RGB+depth-ONLY dataset (e.g. matrixcity): drop the camera keys so MixtureDataset
-            # sets has_raymap=False -> the algorithm noise-fills + loss-masks all ray tokens.
-            # With diffusion_forcing setting [1] the objective is RGB history -> depth future.
-            # Cameras were still used internally above to normalize depth's per-clip scale.
+            # RGB + depth only (e.g. matrixcity): drop the camera keys so MixtureDataset sets
+            # has_raymap=False and the algorithm noise-fills and loss-masks the ray tokens.
             for k in ("raymaps", "raymap_scale", "extrinsics_gt", "intrinsics_gt"):
                 output.pop(k, None)
         if prompt_embeds is not None:

@@ -12,40 +12,34 @@ defaults:
   - dl3dv_colmap@subset/dl3dv_colmap
   - _self_
 
-# ALL-datasets geometry mixture for the 5B scale-preserving run. Every subset is synthetic
-# (=> metric depth) with OpenCV-optical c2w, first-frame-identity, and outputs modified
-# disparity 1/(1+d/scale)*2-1 in [-1,1]. scale_preserving=true makes ALL subsets divide BOTH
-# camera moments AND depth by ONE global constant (datasets/_geometry_constants.GLOBAL_SCALE)
-# so global metric scale is preserved across datasets (NOT per-clip min-max). The mixture
-# propagates height/width/n_frames/raymap_*/scale_preserving to every subset (mixture.py).
-# Each subset_id needs an entry in algorithm.diffusion_forcing.subset_settings (pass [1] each).
+# Base geometry mixture (extended by mixture_parallax14). Every subset yields OpenCV c2w relative
+# to the first frame and depth as disparity 2/(1+d/scale)-1 in [-1, 1]. The mixture propagates
+# height/width/n_frames/raymap_*/scale settings to every subset (datasets/mixture.py). Each
+# subset_id maps to an entry in algorithm.diffusion_forcing.subset_settings.
 data_root: null
 metadata_path: null
 load_prompt_embed: true
 load_video_latent: false
-scale_preserving: false   # set true at launch (dataset.scale_preserving=true)
-# scheme C (SCALE_NORMALIZATION_ANALYSIS.md): set dataset.scale_mode=parallax to normalize
-# BOTH moments and depth per clip by kappa*median(valid depth). null => legacy behavior
-# (per-clip-max or scale_preserving const). NVS subsets (re10k, dl3dv_colmap) ignore it.
+scale_preserving: false   # true: divide depth and moments by each dataset's mutual_scale
+# scale_mode=parallax normalizes moments and depth per clip by kappa * median(valid depth).
+# null: per-clip max, or the mutual_scale constant when scale_preserving. NVS subsets
+# (re10k, dl3dv_colmap) ignore it.
 scale_mode: null
 parallax_kappa: 4.0
-# scheme-C (parallax) depth channel map. "log" (default) = 1-2*clip(alpha*ln(d/median+1),0,1);
-# VAE round-trip abs_rel ~3% vs ~45% for "disparity" (disparity crushes far/deep -> explodes on
-# inversion under VAE noise). "disparity" restores the original 2/(1+d/s)-1. Only affects parallax.
+# Depth channel under scale_mode=parallax: "log" = 1 - 2*clip(alpha*ln(d/median + 1), 0, 1), which
+# survives the VAE round trip far better than "disparity" = 2/(1+d/s) - 1.
 parallax_depth_map: log
 parallax_log_alpha: 0.30
-# scheme-C ray channels 3:6. "companded_origin" (default) replaces the Plücker moment with the
-# mu-law-companded camera origin  co = sign(t/s)·ln(1+μ|t/s|)/ln(1+μ)  (same shared s as depth,
-# Aether-style; fixes dolly attenuation + tiny low-parallax values; exactly invertible via
-# raymap_to_camera). "moment" restores Plücker moment/s. Only affects scale_mode=parallax.
+# Ray channels 3:6 under scale_mode=parallax: "companded_origin" replaces the Pluecker moment with
+# the mu-law-companded camera origin sign(t/s)*ln(1+mu|t/s|)/ln(1+mu) (invertible in
+# raymap_to_camera); "moment" keeps moment/s.
 parallax_ray_encoding: companded_origin
 parallax_mu: 255.0
-# strategy D: dataset.scale_mode=global_metric divides moments AND depth by this ONE global
-# constant (metres) for every dataset/clip (bijective -> metric). Depth -> disparity 2/(1+d/s)-1.
+# scale_mode=global_metric divides moments and depth by this one constant (metres) everywhere.
 global_metric_scale: 10.0
 
-# 288x384 (true 4:3) so the Wan2.2 v2-VAE (16x) latent is 18x24 (even -> patch-2 ok).
-# raymap 36x48 = height//8 x width//8. All 8 loaders crop+resize to this.
+# 288x384 (4:3): the 16x Wan2.2 VAE latent is 18x24, even for the 2x2 patch.
+# Raymap 36x48 = height//8 x width//8. Every subset crops and resizes to this.
 height: 288
 width: 384
 n_frames: 50
@@ -55,16 +49,8 @@ raymap_width: 48
 
 training:
   weight_type: relative
-  # TARGET-SHARE weights for the 2026-07-08 from-scratch A/B runs (LARGE_SCALE_TRAINING.md §4):
-  # effective share_i ∝ w_i × n_records_i, so w_i = share_i / n_i × 1000. TRAINING-split record
-  # counts measured 2026-07-08 through the exact loaders (datasets/moment_scale_modelB.json):
-  #   tartanair=362 v2=1100 spring=36 bedlam=7791 bedlam2=5635 (post-HDRI deletion + loader-level
-  #   *_hdri skip) vkitti2=100 ase=15529 omniworld=7127 re10k=65642 dl3dv_colmap=7811.
-  # Target shares (%): tartanair 22 + tartanair_v2 18 (user call: the two best datasets = TOP-2),
-  #   bedlam 9, bedlam2 9, spring 2 (36 seqs — repetition cap), vkitti2 4, ase 8 (motion-gated:
-  #   mostly depth-only), omniworld 7 (depth-only), re10k 12 (slow ~60s/clip loader — throughput
-  #   cap; was 32.5% under the old sqrt-balance), dl3dv_colmap 9.
-  # point_odyssey REMOVED 2026-07-08 (fake/billboard backgrounds almost always).
+  # relative: sampling share_i is proportional to weight_i * n_records_i
+  # (mixture_parallax14 overrides these for the release recipe).
   weight:
     tartanair: 0.6077
     tartanair_v2: 0.1636

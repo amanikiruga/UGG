@@ -9,7 +9,7 @@
   way standard pinhole unprojection (x_n*z, y_n*z, z) recovers the correct point.
 - Output depths: modified disparity 1/(1 + d/scale) * 2 - 1 in [-1, 1] (invalid=-1).
 - Raymap moments: moments/scale clamped to [-1, 1].
-- scale = max(|raw_moments|.max(), depth_median) — point_odyssey-style indoor floor.
+- scale = max(|raw_moments|.max(), depth_median) (indoor depth-median floor).
 """
 from __future__ import annotations
 
@@ -21,8 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import cv2
-cv2.setNumThreads(0)  # libpng+zlib PNG decode is NOT thread-safe on multi-core -> "bad parameters
-# to zlib" -> cv2.imread returns None intermittently under dataloader workers. Force single-thread.
+cv2.setNumThreads(0)  # cv2's threaded PNG decode can fail (imread returns None); decode single-threaded.
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -105,7 +104,7 @@ class SceneNetRGBDDataset(VideoDataset):
 
     A shared dataset directory is read-only for most users, so
     the per-trajectory `gt_pose/cameras.npz` files (generated once by
-    `scripts/preprocess_scenenet_protobufs.py`) live at a separate writable
+    preprocessing the SceneNet protobufs) live at a separate writable
     root. If `cfg.gt_pose_root` is null/missing, falls back to `cfg.data_root`
     (useful if you've extracted the poses into the dataset directory itself).
     """
@@ -147,8 +146,7 @@ class SceneNetRGBDDataset(VideoDataset):
                           ) -> Tuple[np.ndarray, np.ndarray]:
         depths, valids = [], []
         for fn in frame_nums:
-            # PIL (thread-safe) instead of cv2.imread, which returns None intermittently on
-            # these 16-bit PNGs under multi-threaded libpng (matches scenenet_depth.py).
+            # PIL instead of cv2.imread, which intermittently returns None on these 16-bit PNGs.
             try:
                 with Image.open(io.BytesIO(self._frame_bytes(traj_dir, "depth", fn, "png"))) as im:
                     u16 = np.array(im)
@@ -216,14 +214,12 @@ class SceneNetRGBDDataset(VideoDataset):
     ) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """scale = max(|raw moments|, depth_median).
 
-        SceneNet is indoor with bounded depths (<= 60 m). PointOdyssey-style
-        depth_median floor anchors near-stationary clips so |M| ~= 0 cases
+        SceneNet is indoor with bounded depths (<= 60 m). The depth_median floor anchors near-stationary clips so |M| ~= 0 cases
         don't blow disparity to -1.
 
-        Under scheme C (`dataset.scale_mode=parallax`) this instead divides BOTH the
-        moments and depth by the single per-clip scalar s = kappa*median(valid z-depth),
-        with NO moment clamp, so depth<->pose stay EXACTLY aligned (identical recipe and
-        alignment guarantee as every other geometry loader; SCALE_NORMALIZATION_ANALYSIS.md).
+        Under `dataset.scale_mode=parallax` this instead divides both the moments and depth by
+        one per-clip scalar s = kappa*median(valid z-depth), with no moment clamp, so depth and
+        pose stay aligned (same as the other geometry loaders).
         `depth_metric_for_scale` carries INVALID_DEPTH_SENTINEL at invalid pixels.
         """
         if is_scale_norm_mode(self.cfg):
@@ -278,8 +274,7 @@ class SceneNetRGBDDataset(VideoDataset):
     def _pose_path_for(self, record: Dict[str, Any]) -> Path:
         """gt_pose/cameras.npz path derived from scene_id/trajectory_id/split.
 
-        Kept independent of any cached `pose_path` field so a stale records-manifest
-        (written before this field existed, or by a base walk) can't break loading.
+        Independent of any cached `pose_path` field, so a stale records manifest can't break loading.
         """
         gt_root = self._gt_pose_root()
         scene_id = int(record["scene_id"])
@@ -323,8 +318,7 @@ class SceneNetRGBDDataset(VideoDataset):
         # Trajectory dir holds frames.zip (inode-packed: members photo/<f>.jpg, depth/<f>.png)
         # or the loose photo/ + depth/ subdirs. video_path is "<split>/<scene>/<traj>/photo".
         traj_dir = (self.data_root / record["video_path"]).parent
-        # Resolve pose path from ids rather than trusting a cached field: a records-manifest
-        # written by a base walk (or before pose_path existed) stores pose_path=None.
+        # Resolve the pose path from ids rather than a cached field, which may be None in a manifest.
         pose_path = record.get("pose_path") or str(self._pose_path_for(record))
         pose = np.load(pose_path)
         c2w_all = pose["c2w"]                # (T_src, 4, 4) float32
@@ -332,11 +326,9 @@ class SceneNetRGBDDataset(VideoDataset):
         K_native = pose["K"].astype(np.float64)  # (3, 3)
 
         n_src = int(frame_nums_all.shape[0])
-        # SceneNet photos are ALREADY sparsely sampled (one every 25 render-frames, ~300/traj);
-        # record["fps"]=30 is the RENDER rate, not the photo cadence. Feeding 30 as src_fps makes
-        # _temporal_sample decimate 3x (target_len=round(n_frames/self.fps*30) -> stride 3, skips
-        # 2/3 of the photos). Treat the photos as the frames at the target rate -> stride 1, no
-        # skipping (self.fps as src_fps => target_len == n_frames). Effective output fps = self.fps.
+        # SceneNet photos are already sparse (one every 25 render frames); record["fps"]=30 is the
+        # render rate, not the photo cadence. Use self.fps as the source fps so photos are taken at
+        # stride 1 rather than decimated.
         fps = int(self.fps)
 
         # --- Temporal sample (use base class fps-aware version) ---
@@ -372,7 +364,6 @@ class SceneNetRGBDDataset(VideoDataset):
                             mode="nearest")  # nearest, NOT bilinear: bilinear mixes the 0-stuffed
                             # invalid pixels into valid depths at mask boundaries and creates
                             # flying-pixel depths at object edges (mask is nearest -> misaligned).
-                            # Matches tartanair/spring/bedlam/ase/mvs_synth/matrixcity/mid_air.
         v = F.interpolate(v.float(), size=(self.height, self.width),
                           mode="nearest").bool()
         frames = self.img_normalize(frames).clamp(-1.0, 1.0)
@@ -396,10 +387,7 @@ class SceneNetRGBDDataset(VideoDataset):
         return frames, raymaps, depths, scale, ext_gt, K_gt, depths_raw, depths_valid
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion), matching tartanair: recursive retries pin
-        # each level's partially-decoded tensors via the exception traceback, and when a
-        # whole subset is unreadable they turn a clean OSError into a RecursionError --
-        # which is exactly how this loader's pose tree going missing stayed invisible.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -409,7 +397,7 @@ class SceneNetRGBDDataset(VideoDataset):
                 traj_id = record.get("trajectory_id", "?")
                 scene_id = record.get("scene_id", "?")
                 print(f"Warning: skipping scene {scene_id} traj {traj_id}: {e}")
-                # backoff: transient filesystem stalls fail all instant retries at once
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
@@ -423,12 +411,8 @@ class SceneNetRGBDDataset(VideoDataset):
             "has_caption": bool(record.get("caption", "")),
         }
 
-        # Use the caption cache when configured. `_select_caption` returns
-        # (caption, ABSOLUTE prompt-embed path) for this scene, picking a random
-        # caption variant per __getitem__. Previously this loader read only
-        # record["caption"] and its _load_prompt_embed returned a ZERO tensor, so a
-        # configured caption_cache_dir was silently ignored and every clip trained
-        # with a null text embedding.
+        # Use the caption cache when configured: `_select_caption` returns (caption, absolute
+        # prompt-embed path), picking a random caption variant per call.
         _cap = self._select_caption(record)
         _embed_override = None
         if _cap is not None:
@@ -437,10 +421,7 @@ class SceneNetRGBDDataset(VideoDataset):
             _caption = record.get("caption", "")
         prompts = self.id_token + _caption
         prompt_embeds, prompt_embed_len = None, None
-        # A cache miss is NOT a reason to drop the sample. `_load_prompt_embed_or_null`
-        # falls back to the null embedding (what this subset trained on before captions
-        # were wired up) instead of raising into MixtureDataset's except/continue, which
-        # would make every uncaptioned scene unreachable.
+        # A cache miss falls back to the null embedding rather than dropping the sample.
         _has_caption = _embed_override is not None or bool(_caption)
         if self.load_prompt_embed:
             (
@@ -450,8 +431,7 @@ class SceneNetRGBDDataset(VideoDataset):
             ) = self._load_prompt_embed_or_null(
                 record, path_override=_embed_override
             )
-        # Keep the metadata honest: a cache hit means this clip really does have a
-        # caption, regardless of what record["caption"] said at index time.
+        # A cache hit means this clip has a caption, whatever record["caption"] says.
         video_metadata["has_caption"] = _has_caption
 
         record["height"] = video_metadata["height"]

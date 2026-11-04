@@ -1,42 +1,22 @@
-"""Scheme-G metric depth gauge for pose-only (NVS) datasets — "G3".
+"""Metric depth gauge for the pose-only (NVS) datasets.
 
-WHY THIS EXISTS
----------------
-Scheme G (`dataset.scale_mode=parallax`, `parallax_ray_encoding=moment`) divides the
-Plucker moments AND the depth channel by one shared per-clip scalar
+Under `dataset.scale_mode=parallax` the Pluecker moments and the depth channel are divided by
+one per-clip scalar
 
     s = kappa * median(valid metric depth of the clip)
 
-so the moment channel encodes *scene-relative parallax*. Geometry datasets (TartanAir,
-vkitti2, ...) have metric depth, so they can compute `s`. The NVS datasets do not:
-RE10K/DL3DV carry COLMAP poses with an arbitrary per-clip scale and no depth at all.
+so the moment channel encodes scene-relative parallax. Geometry datasets have metric depth and
+compute `s` directly. RE10K/DL3DV have COLMAP poses at an arbitrary per-scene scale and no
+depth, so without a gauge they would fall back to per-clip max|moment| normalization, putting a
+second, incompatible magnitude code on the shared ray channel.
 
-Before this module those loaders silently fell back to per-clip `max|moment|`
-normalization. In a mixture that is a real bug, not a cosmetic one: the SAME ray channel
-then carries two incompatible magnitude codes at once —
-
-    geometry half : |m| = metric parallax, unclamped, varies freely per clip
-    NVS half      : |m| = fraction of this clip's own max, always exactly 1.0 at the peak
-
-They are spatially indistinguishable (both are Plucker moments), so the shared ray branch
-is pulled toward two different readings of the same number. Measured on the training
-loaders: mean |m| 0.047 (TartanAir, scheme G) vs 0.14 (RE10K, max-norm fallback).
-
-WHAT THIS MODULE PROVIDES
--------------------------
-A per-scene table, built offline, giving each NVS scene its missing gauge:
+This module reads a per-scene table, built offline, that supplies the missing gauge:
 
     s_colmap_units = kappa * median_metric_depth_m * cu_per_m
 
-`cu_per_m` converts metres into that scene's arbitrary COLMAP units. Both numbers come
-from running a metric geometry model (DA3NESTED-GIANT-LARGE) over frames of the scene
-and solving for the depth scale that is multi-view consistent with the scene's OWN
-annotation cameras — NOT from the model's predicted camera scale, which was measured
-wrong by up to 3x on TartanAir ground truth. Validated against ScanNet v2 metric GT to
-~3% (median reprojection-consistency residual 0.38% over 72,519 RE10K scenes).
-
-The table is a plain .npz; see `scripts/build_depth_gauge.py` (not shipped) for
-how it is produced. The loader only reads it.
+`cu_per_m` converts metres into the scene's COLMAP units. Both numbers come from a metric depth
+model run over the scene's frames, solving for the depth scale that is multi-view consistent
+with the scene's own annotation cameras. The table is a plain .npz.
 
 USAGE (dataset yaml)
 --------------------
@@ -44,23 +24,17 @@ USAGE (dataset yaml)
     parallax_kappa: 0.5
     parallax_ray_encoding: moment
     parallax_depth_map: log
-    parallax_gauge_file: /path/to/gauge_v1.npz
+    parallax_gauge_file: /path/to/gauge.npz
 
-KAPPA IS FREE TO RETUNE
------------------------
-Under the log depth map the median is `scale/kappa` while `scale = kappa*median`, so
-kappa CANCELS EXACTLY in the depth channel (verified 0.0 difference across kappa in
-{1,2,4,8}). It is purely a moment-channel gain knob, which is why G3 can use kappa=0.5
-to restore moment amplitude without touching the depth representation that scheme G is
-good at.
+Under the log depth map kappa cancels exactly in the depth channel (the median is scale/kappa),
+so it only sets the gain of the moment channel.
 """
 from typing import Optional, Sequence
 
 import numpy as np
 
-# One table shared by every dataset instance in a worker process. The table is ~30 MB
-# and is read once per worker; keep it UNCOMPRESSED on disk (decompressing 70k unicode
-# scene ids costs ~17 s per worker vs 0.02 s raw).
+# One table shared by every dataset instance in a worker process, read once per worker.
+# Keep it uncompressed on disk: decompressing the scene ids is slow.
 _TABLE_CACHE: dict = {}
 
 
@@ -126,7 +100,7 @@ def gauge_scale(cfg, scene_id: str, clip_timestamps: Optional[Sequence[int]] = N
 
 
 def is_gauge_mode(cfg) -> bool:
-    """True iff this cfg selects scheme G *with* a depth gauge (i.e. G3)."""
+    """True iff this cfg selects scale_mode=parallax with a depth-gauge table."""
     from ._scale_norm import is_parallax_mode, parallax_ray_encoding
     return (is_parallax_mode(cfg)
             and parallax_ray_encoding(cfg) == "moment"

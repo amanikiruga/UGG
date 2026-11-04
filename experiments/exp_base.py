@@ -324,11 +324,9 @@ class BaseLightningExperiment(BasePytorchExperiment):
                 sort_by_key="cuda_time_total", row_limit=40,
             )
 
-        # Async checkpoint writes: the FSDP full-state gather (a collective) stays
-        # synchronous, but serialization + the multi-GB disk write happen in a
-        # background thread over the gathered CPU state dict, so training resumes
-        # immediately after the gather instead of waiting out the network-FS write.
-        # Disable with experiment.training.async_checkpointing=false.
+        # Async checkpoint writes: the FSDP state gather stays synchronous, but serialization and
+        # the disk write run in a background thread. Disable with
+        # experiment.training.async_checkpointing=false.
         _plugins = None
         if getattr(self.cfg.training, "async_checkpointing", True):
             from lightning.pytorch.plugins.io import AsyncCheckpointIO

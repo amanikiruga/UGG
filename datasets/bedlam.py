@@ -18,8 +18,7 @@ normalization helpers (first-frame-identity, Plucker raymaps, mutual scale, dept
 modified-disparity) are inherited verbatim from TartanAirDataset. Only the record walk,
 file IO and the Unreal->OpenCV camera convention differ.
 
-Conventions (camera convention verified by reprojection on camera-moving orbit/zoom
-sequences, see datasets/geometry_verification/bedlam/):
+Conventions:
 - Camera CSV per frame: name,x,y,z,yaw,pitch,roll,focal_length,sensor_width,
   sensor_height,hfov.  Position in cm (Unreal world X-fwd/Y-right/Z-up, left-handed);
   yaw/pitch/roll in degrees (Unreal FRotator).
@@ -64,9 +63,8 @@ MIN_FRAMES = 16                      # skip sequences shorter than this
 # Sideways sequences: some batches (v1 *closeup*, v2 vcam/portrait) were rendered with
 # the camera genuinely rolled ~+-90 deg (world-up along image x). Pixels, depth and
 # extrinsics are mutually consistent as stored, but the CONTENT is sideways, which we
-# must not train on. The roll is in the GT extrinsics (see the per-batch scan in
-# vwm_eval_data/training_data_report/bedlam_bg_audit/roll_scan.json: cleanly bimodal,
-# ~0 or ~-90, constant per batch), so each clip is un-rolled by an exact multiple of
+# must not train on. The roll is in the GT extrinsics (~0 or ~-90 deg, constant per batch),
+# so each clip is un-rolled by an exact multiple of
 # 90 deg: a lossless rot90 of RGB/depth/valid (z-buffer depth is invariant to in-plane
 # rotation), axis-swapped K, and c2w := c2w @ Rz. The residual few-degree handheld
 # roll remains in BOTH pixels and cameras, i.e. stays consistent.
@@ -151,13 +149,11 @@ class BedlamDataset(TartanAirDataset):
 
     def _cached_depth(self, record, frame_ids):
         """Depth window from the pre-decoded cache, already rot90'd/cropped/resized to
-        (self.height, self.width) -- verified bit-exact against the EXR path.
+        (self.height, self.width); bit-exact with the EXR path.
 
-        BEDLAM depth frames are 20-channel multilayer EXRs; pulling the one WorldDepth
-        channel decompresses all 20 and the OpenEXR bindings hold the GIL, so the EXR path
-        reads at 63 MB/s (4.17s per 50-frame clip). The cache is chunked+compressed npz,
-        which numpy loads lazily per key, so only the 1-2 chunks a window touches are
-        decompressed: 0.088s, a 47x speedup. Returns None to fall back to EXR.
+        BEDLAM depth frames are 20-channel multilayer EXRs, which are slow to decode. The cache
+        is a chunked, compressed npz loaded lazily per key, so only the chunks a window touches
+        are decompressed. Returns None to fall back to EXR.
         """
         root = getattr(self.cfg, "depth_cache_root", None) or _DEPTH_CACHE_ROOT
         if not root:
@@ -195,9 +191,7 @@ class BedlamDataset(TartanAirDataset):
     def _load_records(self) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
         for batch in sorted(p for p in self.data_root.iterdir() if p.is_dir()):
-            # v2 *_hdri batches are photo-backdrop renders with NO real background
-            # geometry (see bedlam_bg_audit/) — excluded permanently, and this also
-            # keeps record-building safe while their on-disk deletion is in flight.
+            # v2 *_hdri batches are photo-backdrop renders with no real background geometry.
             if "_hdri" in batch.name:
                 continue
             png_root = batch / "png"
@@ -272,9 +266,7 @@ class BedlamDataset(TartanAirDataset):
 
     @staticmethod
     def _read_rgb_frames(rgb_dir: Path, seq: str, frame_ids: np.ndarray) -> np.ndarray:
-        """Threaded PNG decode. PIL releases the GIL inside the decoder, so 50 frames go
-        from 1.41s serial to 0.10s at 16 threads (measured); the filesystem sustains
-        ~726 MB/s under this pattern, so serial reads were leaving 13x on the table."""
+        """Threaded PNG decode (PIL releases the GIL inside the decoder)."""
         def _one(fid):
             return np.asarray(iio.imread(str(rgb_dir / f"{seq}_{int(fid):04d}.png")))[..., :3]
         with ThreadPoolExecutor(_RGB_THREADS) as ex:
@@ -285,9 +277,7 @@ class BedlamDataset(TartanAirDataset):
         depths, valids = [], []
         for fid in frame_ids:
             # v1 names depth EXRs "<seq>_NNNN_depth.exr"; v2 (exr_depth/) names
-            # them plain "<seq>_NNNN.exr". Every v2 load raised OSError before
-            # this fallback existed, which the recursive-retry __getitem__ then
-            # amplified into ~100GB worker OOMs.
+            # them plain "<seq>_NNNN.exr".
             p = depth_dir / f"{seq}_{int(fid):04d}_depth.exr"
             if not p.exists():
                 p = depth_dir / f"{seq}_{int(fid):04d}.exr"

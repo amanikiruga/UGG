@@ -10,7 +10,7 @@ load_video_latent: false
 trim_mode: random_cut
 pad_mode: slowdown
 max_mean_adj_rotation_deg: 3.5
-fps: 10      # calibrated (tune_fps @ 50 samples; target ~0.45°/frame via re10k pivot)
+fps: 10      # chosen for ~0.45 deg/frame camera rotation, matching re10k
 fps_source: 10
 n_frames: 49
 test_percentage: 0.0
@@ -27,11 +27,10 @@ augmentation:
   ratio: null
   scale: null
 
-# Per-dataset scale_preserving constant = this datasets measured depth-P90 (scripts/compute_global_scale.py).
-# scale_preserving=True divides BOTH depth and camera-moments by this so each datasets depth-disparity
-# distribution lands in the same ~[0.4,0.9] range -> datasets "look the same" (vs one global 30 that made
-# ASE 2-5m scenes saturate near +1 while vkitti2 130m spread to -1). metric scale preserved WITHIN each dataset.
+# Per-dataset scale (the dataset's depth P90, metres). With scale_preserving=true, depth and camera
+# moments are both divided by it, so every dataset's disparity lands in a similar range while metric
+# scale is preserved within the dataset.
 mutual_scale: 89.0
 
-# record-walk cache (scripts/build_records_manifest.py) — instant startup; delete if data changes
+# Cached list of records, written on first run; delete it if the data changes.
 records_manifest: _records_manifest.json

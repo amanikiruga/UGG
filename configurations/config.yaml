@@ -12,10 +12,10 @@ data_dir: ???
 debug: false # global debug flag will be passed into configuration of experiment, dataset and algorithm
 
 wandb:
-  entity: your-wandb-entity # wandb account name / organization name [fixme]
+  entity: your-wandb-entity # wandb account name / organization name
   project: ugg # wandb project name
   mode: online # set wandb logging to online, offline or dryrun
   log_model: false # whether log ckpt and upload to wandb. "all" is recommended but may take a lot of space
 
 resume: null # wandb run id to resume logging and loading checkpoint from
-load: null # wanmdb run id containing checkpoint or a path to a checkpoint file 
+load: null # wandb run id containing checkpoint or a path to a checkpoint file

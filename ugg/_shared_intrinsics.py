@@ -1,5 +1,4 @@
 from __future__ import annotations
-#!/usr/bin/env python3
 """Prediction-only camera recovery with one intrinsic matrix per clip.
 
 The existing raymap-to-camera implementation decomposes every frame's ray

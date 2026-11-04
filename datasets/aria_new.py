@@ -11,9 +11,7 @@ from typing import Any, Dict, Tuple, Optional, List
 from torchvision.transforms import v2 as transforms
 from tqdm import tqdm
 from .video_base import VideoDataset
-# import path
 from pathlib import Path
-# from algorithms.wan.utils.raymap import camera_to_raymap
 
 DEPTH_STATS = None
 DEPTH_STATS_PATH = "depth_stats.json"
@@ -25,7 +23,6 @@ def load_depth_stats(depth_stats_path: Path):
         # convert depth from millimeters to meters
         DEPTH_STATS["min"] = DEPTH_STATS["min"] / 1000.0
         DEPTH_STATS["max"] = DEPTH_STATS["max"] / 1000.0
-# done
 
 # Global ray moment statistics computed over the Aria training split.
 # Used to normalize moments to [-1, 1] consistently across all sequences.
@@ -147,11 +144,7 @@ def _intersect_skew_lines(points: torch.Tensor, directions: torch.Tensor) -> tor
     return torch.linalg.lstsq(lhs, rhs).solution
 
 
-# The inverse of `camera_to_raymap` is `datasets/re10k.py::raymap_to_camera`, which is the
-# copy the model and the evaluation path use. A second, older implementation used to sit
-# here; it predated normalized moments (no raymap_scale, no companded-origin encoding) and
-# nothing in the repo imported it, so two divergent inverses were being carried for one
-# forward map. Removed 2026-08-27.
+# The inverse of `camera_to_raymap` is `datasets/re10k.py::raymap_to_camera`.
 
 
 
@@ -205,7 +198,6 @@ class AriaDataset(VideoDataset):
             if depth_dir.exists(): 
                 record["depth_dir"] = str(seq_dir.relative_to(self.data_root) / "depth")
             records.append(record)
-            #done
 
         print(f"Found {len(records)} Aria sequences in {self.data_root}")
         
@@ -386,7 +378,6 @@ class AriaDataset(VideoDataset):
             with open("ignore/failed_videos.txt", "a") as f:
                 f.write(video_path + "\n")
             return self.__getitem__(random.randint(0, len(self.records) - 1))
-        # images = videos[:1].clone() if self.image_to_video else None
         image_latents, video_latents = None, None
         video_metadata = {
             "num_frames": videos.shape[0],
@@ -443,8 +434,6 @@ class AriaDataset(VideoDataset):
             output["depths"] = depths
         if prompts is not None:
             output["prompts"] = prompts
-        # if images is not None:
-        #     output["images"] = images
         if prompt_embeds is not None:
             output["prompt_embeds"] = prompt_embeds
             output["prompt_embed_len"] = prompt_embed_len
@@ -600,23 +589,9 @@ class AriaDataset(VideoDataset):
         Returns:
             raymaps with channels 3:6 mapped to [-1, 1] and clamped.
         """
-        # ray_moments = raymaps[:, 3:6, :, :]
-        # scale = (_MOMENT_MAX - _MOMENT_MIN) / 2.0          # 21.2669
-        # shift = (_MOMENT_MAX + _MOMENT_MIN) / 2.0          # -2.4903
-        # raymaps[:, 3:6, :, :] = torch.clamp((ray_moments - shift) / scale, -1.0, 1.0)
-        
         max_abs = max(abs(_MOMENT_MIN), abs(_MOMENT_MAX))
         raymaps[:, 3:6, :, :] = torch.clamp(raymaps[:, 3:6, :, :] / max_abs, -1.0, 1.0)
 
-        # log norm 
-
-        # import math
-        # _LOG_MOMENT_MIN = math.copysign(math.log1p(abs(_MOMENT_MIN)), _MOMENT_MIN)
-        # _LOG_MOMENT_MAX = math.copysign(math.log1p(abs(_MOMENT_MAX)), _MOMENT_MAX)
-        # log_scale = (_LOG_MOMENT_MAX - _LOG_MOMENT_MIN) / 2.0
-        # log_shift = (_LOG_MOMENT_MAX + _LOG_MOMENT_MIN) / 2.0
-        # log_moments = torch.sign(ray_moments) * torch.log1p(ray_moments.abs())
-        # raymaps[:, 3:6, :, :] = torch.clamp((log_moments - log_shift) / log_scale, -1.0, 1.0)
 
         return raymaps
     
@@ -648,7 +623,6 @@ if __name__ == "__main__":
     from pathlib import Path
     from omegaconf import DictConfig
     
-    # data_root = Path(__file__).parent.parent / "data" / "Aria"
     data_root = Path("./data/Aria")
     
     cfg = DictConfig({

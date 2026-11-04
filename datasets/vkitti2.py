@@ -238,9 +238,8 @@ class VirtualKitti2Dataset(VideoDataset):
         depths, valids = [], []
         for fid in frame_ids:
             p = depth_dir / f"depth_{int(fid):05d}.png"
-            # PIL (thread-safe) instead of cv2.imread: cv2's libpng+zlib path returns None
-            # intermittently on these 16-bit PNGs under dataloader load even with
-            # setNumThreads(0) (matches the scenenet fix). The file is fine; cv2 is flaky.
+            # PIL instead of cv2.imread: cv2 intermittently returns None on these 16-bit PNGs
+            # under dataloader load.
             try:
                 with Image.open(p) as im:
                     u16 = np.array(im)
@@ -329,7 +328,7 @@ class VirtualKitti2Dataset(VideoDataset):
         """
         moments = raymaps_raw[:, 3:6]
         if is_scale_norm_mode(self.cfg):
-            # Scheme C (SCALE_NORMALIZATION_ANALYSIS.md): per-clip s = kappa*median(valid depth).
+            # scale_mode=parallax: per-clip s = kappa*median(valid depth).
             return apply_scale_norm(raymaps_raw, depth_metric, self.cfg, INVALID_DEPTH_SENTINEL)
         elif self.cfg.get("scale_preserving", False):
             scale = float(self.cfg.get("mutual_scale", None) or GLOBAL_SCALE)   # per-dataset (yaml) else global
@@ -358,8 +357,6 @@ class VirtualKitti2Dataset(VideoDataset):
         depth_dir = seq_root / "frames" / "depth" / record["camera"]
 
         temporal_indices = self._temporal_sample(record["n_frames"], record["fps"])
-        # if not getattr(self.cfg, "no_augmentations", False) and random.random() < 0.5:
-        #     temporal_indices = temporal_indices[::-1].copy()
 
         # --- RGB ---
         rgb_np = self._read_rgb_frames(rgb_dir, temporal_indices)
@@ -387,7 +384,6 @@ class VirtualKitti2Dataset(VideoDataset):
                             mode="nearest")  # nearest, NOT bilinear: bilinear mixes the 0-stuffed
                             # invalid pixels into valid depths at mask boundaries and creates
                             # flying-pixel depths at object edges (mask is nearest -> misaligned).
-                            # Matches tartanair/spring/bedlam/ase/mvs_synth/matrixcity/mid_air.
         v = F.interpolate(v.float(), size=(self.height, self.width),
                           mode="nearest").bool()
         frames = self.img_normalize(frames).clamp(-1.0, 1.0)
@@ -412,10 +408,7 @@ class VirtualKitti2Dataset(VideoDataset):
         return frames, raymaps, depths, scale, ext_gt, K_gt, depths_raw, depths_valid
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion): recursive retries pin each level's
-        # partially-decoded tensors via the exception traceback; with many failing
-        # records (e.g. bedlam2's misnamed depth files) DataLoader workers ballooned
-        # to ~100GB and were OOM-killed, silently losing the sample.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -423,8 +416,7 @@ class VirtualKitti2Dataset(VideoDataset):
                 break
             except (OSError, ValueError, KeyError, RuntimeError) as e:
                 print(f"Warning: skipping {record.get('seq_id', idx)}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
@@ -438,12 +430,8 @@ class VirtualKitti2Dataset(VideoDataset):
             "has_caption": False,
         }
 
-        # Use the caption cache when configured. `_select_caption` returns
-        # (caption, ABSOLUTE prompt-embed path) for this scene, picking a random
-        # caption variant per __getitem__. Previously this loader read only
-        # record["caption"] and its _load_prompt_embed returned a ZERO tensor, so a
-        # configured caption_cache_dir was silently ignored and every clip trained
-        # with a null text embedding.
+        # Use the caption cache when configured: `_select_caption` returns (caption, absolute
+        # prompt-embed path), picking a random caption variant per call.
         _cap = self._select_caption(record)
         _embed_override = None
         if _cap is not None:
@@ -452,10 +440,7 @@ class VirtualKitti2Dataset(VideoDataset):
             _caption = record.get("caption", "")
         prompts = self.id_token + _caption
         prompt_embeds, prompt_embed_len = None, None
-        # A cache miss is NOT a reason to drop the sample. `_load_prompt_embed_or_null`
-        # falls back to the null embedding (what this subset trained on before captions
-        # were wired up) instead of raising into MixtureDataset's except/continue, which
-        # would make every uncaptioned scene unreachable.
+        # A cache miss falls back to the null embedding rather than dropping the sample.
         _has_caption = _embed_override is not None or bool(_caption)
         if self.load_prompt_embed:
             (
@@ -465,8 +450,7 @@ class VirtualKitti2Dataset(VideoDataset):
             ) = self._load_prompt_embed_or_null(
                 record, path_override=_embed_override
             )
-        # Keep the metadata honest: a cache hit means this clip really does have a
-        # caption, regardless of what record["caption"] said at index time.
+        # A cache hit means this clip has a caption, whatever record["caption"] says.
         video_metadata["has_caption"] = _has_caption
 
         record["height"] = video_metadata["height"]

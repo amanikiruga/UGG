@@ -23,13 +23,11 @@ from utils.re10k_correctness import (
     exclude_invalid_video_records,
     select_re10k_clip,
 )
-# from algorithms.wan.utils.raymap import camera_to_raymap
 
 
 MIN_RAYMAP_SCALE = 1.0  # floor for per-clip max-abs moment normalization
-# Global per-channel divisor for Plücker moments, anchored on DL3DV-dominated
-# p95 of raw |moments| (scripts/collect_raymap_moment_stats.py). Used only
-# when cfg.scale_preserving=True; preserves inter-clip translation extent.
+# Fixed per-channel divisor for Pluecker moments, used only when cfg.scale_preserving=True
+# (preserves translation extent across clips).
 GLOBAL_MOMENT_DIVISOR = (1.3, 5.0, 1.9)
 
 
@@ -319,9 +317,8 @@ class RE10KDataset(VideoDataset):
     def __init__(self, cfg, split: str = "training") -> None:
         super().__init__(cfg, split)
 
-        # Production normally loads VideoDataset's cached JSON manifest, which
-        # bypasses RE10KDataset._load_records(). Filter after that boundary so
-        # cached and freshly scanned records have identical semantics.
+        # Records may come from the cached manifest, which bypasses _load_records();
+        # filter here so both paths behave the same.
         invalid_video_ids = self.cfg.get("invalid_video_ids", []) or []
         self.records, removed = exclude_invalid_video_records(
             self.records, invalid_video_ids
@@ -406,27 +403,13 @@ class RE10KDataset(VideoDataset):
             total_anno_files += len(anno_files)
 
             for anno_file in tqdm(anno_files, desc=f"Loading {split} annotations"):
-            # for anno_file in anno_files[:10]:
                 # The annotation file name (without .txt) should match the video ID
                 video_id = anno_file.stem
                 
-                # # Get video metadata using cv2
-                # cap = cv2.VideoCapture(str(video_path))
-                # if not cap.isOpened():
-                #     if self.debug:
-                #         print(f"Warning: Cannot open video {video_path}, skipping.")
-                #     continue
-                
-                # width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                # height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                # fps = cap.get(cv2.CAP_PROP_FPS)
-                # n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                # cap.release()
                 
                 # Count annotations to estimate usable frames
                 with open(anno_file, 'r') as f:
                     videoPathURL = f.readline().rstrip()  # skip first line (video URL)
-                    # n_annotations = sum(1 for _ in f)
                     youtubeIDOffset = videoPathURL.find("/watch?v=") + len('/watch?v=')
                     youtubeID = videoPathURL[youtubeIDOffset:]
                 
@@ -553,9 +536,6 @@ class RE10KDataset(VideoDataset):
         """
 
         video_path = self.data_root / record['video_path']
-        # frames = iio.imread(video_path)
-        # frames = torch.from_numpy(frames) # (T, H, W, 3)
-        # n_frames = frames.shape[0]
 
         # get annotations
         anno_path = self.data_root / record['anno_path']
@@ -572,13 +552,8 @@ class RE10KDataset(VideoDataset):
                     'intrinsics': intrinsics,
                     'pose': pose})
 
-        # Seek-read ONLY the annotated frames instead of decoding the whole video.
-        # re10k mp4s are full-length YouTube videos, so iio.imread(index=None) was
-        # decoding the entire clip (often many GB) into RAM per worker -> OOM. decord
-        # seeks to the requested frames. Returned frames are bit-equivalent (ffmpeg).
-        # num_threads=1 avoids decord's threaded-decoder EAGAIN bug
-        # (avcodec_send_packet -11); we only decode ~hundreds of frames so single
-        # thread is plenty fast and far more robust.
+        # Seek-read only the annotated frames: RE10K mp4s are full-length videos and decoding
+        # them whole runs out of memory. num_threads=1 avoids decord's threaded-decoder EAGAIN error.
         vr = decord.VideoReader(str(video_path), num_threads=1)
         fps = float(vr.get_avg_fps())
         total_frames = len(vr)
@@ -654,10 +629,7 @@ class RE10KDataset(VideoDataset):
         return frames, raymaps, raymaps_inv, raymap_scale, raymap_inv_scale, extrinsics_gt, intrinsics_gt
     
     def __getitem__(self, idx) -> Dict[str, Any]:
-        # Bounded retry LOOP (not recursion): recursive retries pin each level's
-        # partially-decoded tensors via the exception traceback; with many failing
-        # records (e.g. bedlam2's misnamed depth files) DataLoader workers ballooned
-        # to ~100GB and were OOM-killed, silently losing the sample.
+        # Bounded retry loop rather than recursion, so failed attempts' tensors are freed.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -666,14 +638,12 @@ class RE10KDataset(VideoDataset):
             except (OSError, ValueError, RuntimeError, decord.DECORDError) as e:
                 video_path = record.get('video_path', str(idx))
                 print(f"Warning: skipping corrupted/invalid video {video_path}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:
             record = self.records[0]
             videos, raymaps, raymaps_inv, raymap_scale, raymap_inv_scale, extrinsics_gt, intrinsics_gt = self._load_video(record)
-        # images = videos[:1].clone() if self.image_to_video else None
         image_latents, video_latents = None, None
         video_metadata = {
             "num_frames": videos.shape[0],
@@ -733,8 +703,6 @@ class RE10KDataset(VideoDataset):
 
         if prompts is not None:
             output["prompts"] = prompts
-        # if images is not None:
-        #     output["images"] = images
         if prompt_embeds is not None:
             output["prompt_embeds"] = prompt_embeds
             output["prompt_embed_len"] = prompt_embed_len
@@ -771,7 +739,7 @@ class RE10KDataset(VideoDataset):
             image_size: (H_src, W_src) of the raw video frames
             raymap_size: (H, W) target raymap grid
             crop_box: (top, bot, left, right) aspect-preserving center crop.
-                      If None, falls back to legacy behaviour (K directly at raymap res).
+                      If None, K is used directly at raymap resolution.
             frame_hw: (H_out, W_out) frame resolution after crop+resize.
                       Required when crop_box is given.
         Returns:
@@ -847,14 +815,6 @@ class RE10KDataset(VideoDataset):
         
         
         travel = sum(torch.norm(t_c2w_list[i] - t_c2w_list[i-1]).item() for i in range(1, len(t_c2w_list)))
-        # print(f"camera travel: {travel:.4f}", "min_camera_travel:", getattr(self.cfg, 'min_camera_travel', 0.0))
-
-        # # Filter near-static sequences
-        # min_travel = getattr(self.cfg, 'min_camera_travel', 0.0)
-        # if min_travel > 0.0:
-        #     travel = sum(torch.norm(t_c2w_list[i] - t_c2w_list[i-1]).item() for i in range(1, len(t_c2w_list)))
-        #     if travel < min_travel:
-        #         raise ValueError(f"Near-static camera (travel={travel:.4f} < {min_travel}), skipping.")
 
         # Normalize cameras: make first camera identity
         R_c2w_normalized, t_c2w_normalized = self._normalize_cameras(
@@ -903,11 +863,9 @@ class RE10KDataset(VideoDataset):
         extrinsics_gt = torch.stack(extrinsics_gt_list, dim=0)  # (n_frames, 4, 4) c2w OpenCV
         intrinsics_gt = torch.stack(intrinsics_gt_list, dim=0)  # (n_frames, 3, 3) pixel K at raymap res
 
-        # Per-sample max-abs normalization of the Plucker moments.
-        # Forward and inverse raymaps encode different camera motions; scale
-        # each independently so both fill the [-1, 1] range.
-        # Under the G3 depth gauge both raymaps share ONE scene-depth scale (same clip),
-        # matching the geometry loaders' shared-scalar convention.
+        # Per-sample max-abs normalization of the Pluecker moments. Forward and inverse raymaps
+        # encode different camera motions, so each is scaled independently; under the depth gauge
+        # both share the clip's scene-depth scale, as in the geometry loaders.
         clip_ts = [a["timeStamp"] for a in final_annos]
         raymaps, raymap_scale = self._normalize_ray_moments(
             raymaps, scene_id=scene_id, clip_timestamps=clip_ts)
@@ -996,17 +954,14 @@ class RE10KDataset(VideoDataset):
         from ._scale_norm import (is_parallax_mode, parallax_ray_encoding,
                                   companded_origin_ray_norm)
         if is_parallax_mode(self.cfg) and parallax_ray_encoding(self.cfg) == "companded_origin":
-            # keep ray-channel semantics consistent with the geometry loaders under scheme C
-            # (spatially-constant mu-law origins); gauge = per-clip max origin (no metric depth).
+            # same ray encoding as the geometry loaders (spatially constant mu-law origins);
+            # gauged by the clip's max origin since RE10K has no metric depth
             return companded_origin_ray_norm(raymaps, self.cfg, MIN_RAYMAP_SCALE)
         from ._depth_gauge import gauge_scale, is_gauge_mode
         if is_gauge_mode(self.cfg) and scene_id is not None:
-            # G3: same gauge as the geometry loaders -- moments / (kappa * median metric
-            # scene depth, expressed in this scene's COLMAP units). NOT clamped: clamping
-            # is the only op that can desync the pose channel from the depth channel.
-            # A scene missing from the table RAISES (see _depth_gauge.gauge_scale): there
-            # is no silent fall-through to max-norm, because that would put two magnitude
-            # codes on one ray channel. Prune ungauged scenes from the records instead.
+            # Same gauge as the geometry loaders: moments / (kappa * median metric scene depth, in
+            # this scene's units). Not clamped, so the pose and depth channels stay consistent.
+            # Scenes missing from the gauge table raise (see _depth_gauge.gauge_scale).
             out = raymaps.clone()
             s_g3 = gauge_scale(self.cfg, scene_id, clip_timestamps)
             out[:, 3:6] = raymaps[:, 3:6] / s_g3
@@ -1075,7 +1030,6 @@ if __name__ == "__main__":
     from pathlib import Path
     from omegaconf import DictConfig
     
-    # data_root = Path(__file__).parent.parent / "data" / "re10k"
     data_root = Path("./data/re10k")
     
     cfg = DictConfig({

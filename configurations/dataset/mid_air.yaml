@@ -2,13 +2,9 @@ defaults:
   - video_base
   - _self_
 
-# Mid-Air (midair.ulg.ac.be): low-altitude drone flights over unstructured terrain,
-# 1024x1024 @ 25 fps, GT metric depth (float16 PNG, EUCLIDEAN RAY DISTANCE -> loader
-# converts to z-depth) + 100 Hz GT poses in NED (quaternion wxyz). Kite_training
-# (4 climates x ~30 traj) + PLE_training (3 seasons). Geometry identical to TartanAir
-# after conversion (OpenCV optical c2w, first-frame identity, modified disparity,
-# Plucker raymaps). Convention verified: datasets/geometry_verification/mid_air/
-# check_raw_reproj.py -> 0.12% median rel depth reproj error (wrong hypotheses 2-5%).
+# Mid-Air (midair.ulg.ac.be): low-altitude drone flights, 1024x1024 @ 25 fps. Metric depth is
+# stored as Euclidean ray distance (the loader converts it to z-depth); poses are 100 Hz NED with
+# wxyz quaternions. Kite_training (4 climates) + PLE_training (3 seasons).
 data_root: ${data_dir}/mid_air
 metadata_path: ""
 load_prompt_embed: true
@@ -16,13 +12,12 @@ caption_cache_dir: ${data_dir}/captions/mid_air
 load_video_latent: false
 trim_mode: random_cut
 pad_mode: slowdown
-# Native 25 fps, trajectories ~2205 frames. Drone motion is fast; fps==fps_source
-# (stride 1) to keep per-frame rotation moderate. Re-calibrate after motion stats.
+# Native 25 fps, sampled consecutively to keep per-frame rotation moderate.
 fps: 25
 fps_source: 25
 n_frames: 50
 test_percentage: 0.02
-# Source is square 1024x1024; loader center-crops to 4:3 then resizes (like others).
+# The square source is center-cropped to 4:3 and resized.
 height: 240
 width: 320
 raymap_height: 30   # height // 8
@@ -36,14 +31,11 @@ augmentation:
   ratio: null
   scale: null
 
-# Measured over 40 clips, full 189-trajectory download (2026-07-13): moment-max
-# M50=14 M90=27; depth p50-of-p50=20m, D90-of-p90=466m. Model-B scheme
-# max(M90, D90/9) = 52. Motion in-family: rot/frame p50=0.31deg p90=1.29deg,
-# parallax p50=0.019 at native 25 fps.
+# Per-dataset scale: max(P90 of the per-clip moment max, P90 depth / 9), metres.
 mutual_scale: 52.0
 
-# one-time record-walk cache (scripts/build_records_manifest.py); instant startup after first build
+# Cached list of records, written on first run; delete it if the data changes.
 records_manifest: _records_manifest.json
 
-# Static scene -> temporal-reverse augmentation is a valid backward camera path (2026-07-13).
+# Static scenes: a time-reversed clip is a valid backward camera path.
 allow_temporal_reverse: true

@@ -11,8 +11,8 @@ def depth_from_norm(depth_norm: np.ndarray, percentile_clip: float | None = 2.0,
     """(T, H, W) normalized disparity -> (T, H, W) relative depth.
 
     `percentile_clip` floors disparity at its p-th percentile over the whole clip before the
-    1/disp inversion, so far/sky pixels stay bounded. 2.0 is the historical default; 10 measured
-    better on KITTI, Sintel and ScanNet++.
+    1/disp inversion, so far/sky pixels stay bounded. 2.0 is the default; ~10 tends to suit
+    outdoor and large scenes better.
     """
     disp = (np.asarray(depth_norm, dtype=np.float32) + 1.0) * 0.5
     lo = eps

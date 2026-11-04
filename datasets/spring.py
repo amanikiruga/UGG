@@ -2,15 +2,14 @@
 
 High-res (1920x1080) Blender-rendered stereo benchmark (Mehl et al., CVPR'23). We use
 the LEFT view only: frame_left/*.png + disp1_left/*.dsp5 + cam_data/{intrinsics,
-extrinsics}.txt. This is exactly the subset Geo4D re-hosts for training.
+extrinsics}.txt.
 
 Geometry is made IDENTICAL to TartanAir (datasets/tartanair.py) so the two mix cleanly:
 the geometry / normalization helpers (first-frame-identity, raymap generation, mutual
 scale, depth->modified-disparity) are inherited verbatim from TartanAirDataset. Only the
 record walk, file IO and camera convention differ.
 
-Conventions (verified by reprojection, see datasets/geometry_verification/spring/;
-median frame-to-frame reprojection depth error ~0.05% on camera-moving sequences):
+Conventions:
 - Intrinsics: per-frame pinhole `fx fy cx cy` at full-HD (cx=960, cy=540). Some scenes
   zoom, so K varies per frame.
 - Depth: Z = fx * B / disp, baseline B = 0.065 m. disp1_left is stored at 2x resolution

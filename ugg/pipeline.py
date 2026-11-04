@@ -29,7 +29,7 @@ from .io import center_crop_resize, legal_num_frames, prepare_video
 
 REPO = Path(__file__).resolve().parents[1]
 _UNSET = object()  # percentile_clip=None is meaningful (no clip), so it needs its own sentinel
-RELEASE_CKPT = "/n/lab_storage/ydu_lab/Lab/akiruga/world_model_4d/final_release_checkpoints/spdepth_2250_NVS25.7263_BEST.ckpt"
+RELEASE_CKPT = "amanim71/UGG/ugg_release.safetensors"
 
 
 def compose_config(overrides: Sequence[str] = ()) -> DictConfig:
@@ -74,6 +74,9 @@ class Prediction:
         cmap = matplotlib.colormaps["Spectral_r"]
         vis = (cmap(np.clip((disp - lo) / max(hi - lo, 1e-6), 0, 1))[..., :3] * 255).astype(np.uint8)
         iio.imwrite(out / "depth.mp4", vis, fps=fps)
+        from .camviz import render_cameras
+        cams = np.stack([np.asarray(f) for f in render_cameras(self.c2w, 640, 480)])
+        iio.imwrite(out / "cameras.mp4", cams, fps=fps)
         return out
 
 

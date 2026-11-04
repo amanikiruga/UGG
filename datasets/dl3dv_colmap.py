@@ -1,8 +1,6 @@
-"""DL3DV with the ORIGINAL COLMAP-derived poses (not ViPE) — NVS-only.
+"""DL3DV with its official COLMAP-derived poses — NVS only.
 
-Reads a processed DL3DV tree that stores DL3DV's official COLMAP-derived cameras in two
-layouts (verified against ViPE poses: 0.08-0.10 deg rotation / translation-direction
-error for the convention used here, 60-100 deg for the alternatives):
+Reads a processed DL3DV tree that stores the cameras in two layouts:
 
   dense (1K~7K): <split>/<scene>/dense/rgb/frame_%05d.png  (954x536)
                  <split>/<scene>/dense/cam/frame_%05d.npz  {intrinsic (3,3) at
@@ -11,8 +9,7 @@ error for the convention used here, 60-100 deg for the alternatives):
                   <split>/<scene>/transforms.json  (nerfstudio: c2w OpenGL,
                   K at full 3840x2160; frames contiguous, every frame has a png)
 
-COLMAP scale is ARBITRARY per scene (measured ~0.5-0.6x ViPE-metric on probe
-scenes) and there is NO depth — so this is a pure novel-view-synthesis subset
+COLMAP scale is arbitrary per scene and there is no depth — so this is a pure novel-view-synthesis subset
 like re10k: rays as history, RGB as target (diffusion-forcing settings [2, 3]).
 The mixture auto-injects has_depth=False (depths key absent).
 """
@@ -38,12 +35,9 @@ from .aria_new import camera_to_raymap
 from .video_base import VideoDataset
 
 MIN_RAYMAP_SCALE = 1.0  # floor for per-clip max-abs moment normalization
-# P90 of raw |moments| over 60 random clips at mixture geometry (first-frame-
-# identity, 288x384), measured 2026-07-07 -> datasets/dl3dv_colmap_moment_stats.json
-# (p50 0.37 / p90 1.97 / p95 2.86 / max 9.5). Used when scale_preserving=True so
-# moment magnitude stays comparable across clips (COLMAP scale is arbitrary per
-# scene, so unlike the metric datasets this preserves only the DATASET-level
-# moment distribution, not metres). Unclamped, like re10k/dl3dv's fixed divisors.
+# P90 of raw |moments| at mixture geometry (first-frame identity, 288x384). Used when
+# scale_preserving=True so moment magnitude stays comparable across clips (COLMAP scale is
+# arbitrary, so this preserves the dataset-level moment distribution, not metres).
 GLOBAL_MOMENT_DIVISOR_P90 = 2.0
 
 # nerfstudio/OpenGL c2w -> OpenCV c2w (flip y/z camera axes)
@@ -97,8 +91,8 @@ class DL3DVColmapDataset(VideoDataset):
         if not self.filtering.disable:
             records = [r for r in records if self._filter_record(r)]
 
-        # Same prompt-embed layout as DL3DVDataset: <root>/<split>/<obj_id>.pt,
-        # zeros fallback at load time when the file doesn't exist.
+        # Prompt-embed layout: <root>/<split>/<obj_id>.pt, zeros fallback at load time
+        # when the file doesn't exist.
         embeds_root = Path(self.cfg.prompt_embeds_root)
         n_with_embed = 0
         for r in records:
@@ -122,7 +116,7 @@ class DL3DVColmapDataset(VideoDataset):
 
     def _caption_for(self, split, obj_id):
         """captions.csv at <data_root>/captions.csv (split,scene_id,frame_indices,caption)
-        — same file the ViPE-based DL3DVDataset uses (rgb_root == this data_root)."""
+"""
         if not hasattr(self, "_caption_map"):
             self._caption_map = {}
             import csv as _csv
@@ -207,26 +201,17 @@ class DL3DVColmapDataset(VideoDataset):
                                   companded_origin_ray_norm)
         from ._depth_gauge import gauge_scale, is_gauge_mode
         if is_parallax_mode(self.cfg) and parallax_ray_encoding(self.cfg) == "companded_origin":
-            # scheme-C consistency with the geometry loaders: spatially-constant mu-law origin
-            # channels; gauge = per-clip max origin (COLMAP scale is arbitrary anyway).
+            # same ray encoding as the geometry loaders (spatially constant mu-law origins);
+            # gauged by the clip's max origin since COLMAP scale is arbitrary
             return companded_origin_ray_norm(raymaps, self.cfg, MIN_RAYMAP_SCALE)
         if is_gauge_mode(self.cfg) and obj_id is not None:
-            # G3: identical gauge to re10k.py and the geometry loaders --
-            # s = kappa * median(metric scene depth) in this scene's COLMAP units.
-            # `clip_idx` are FRAME INDICES, which is what the DL3DV extractor stored as
-            # `ts`: both sides sort dense cams by globbed filename and flat frames by
-            # transforms.json `file_path`, so the two indexings agree. Per-frame medians
-            # vary a lot within a DL3DV scene (1.7 m to 5.5 m is typical), so the gauge is
-            # taken over the SAMPLED frames rather than the whole scene.
-            # A scene absent from the table RAISES; ungauged and poorly-constrained scenes
-            # are pruned from the records offline. Falling through to max-norm would put a
-            # second magnitude code on the ray channel -- the bug the gauge removes, and at
-            # dl3dv_colmap's ~9% mixture share it would dwarf the RE10K case it fixes.
+            # Same gauge as re10k.py and the geometry loaders: s = kappa * median(metric scene
+            # depth) in this scene's COLMAP units, taken over the sampled frames (`clip_idx` are
+            # frame indices, matching the gauge table). Scenes missing from the table raise.
             out = raymaps.clone()
             s = gauge_scale(self.cfg, obj_id, clip_idx)
             out[:, 3:6] = raymaps[:, 3:6] / s
-            # Bounded now: this exact line fed 9.24e10 to the model on 2026-09-02 when a
-            # diverged COLMAP pose (frame_00184, |t|=3.77e12) landed in a sampled window.
+            # Bounded: a diverged COLMAP pose can otherwise produce enormous moments.
             from ._scale_norm import clamp_moments_
             clamp_moments_(out, self.cfg)
             return out, s
@@ -314,7 +299,7 @@ class DL3DVColmapDataset(VideoDataset):
         return frames, raymaps, scale, ext_gt, K_gt
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        # Bounded retry (as dl3dv.py): avoid unbounded recursion on bad files.
+        # Bounded retry loop rather than recursion on unreadable files.
         for _attempt in range(8):
             record = self.records[idx]
             try:
@@ -322,8 +307,7 @@ class DL3DVColmapDataset(VideoDataset):
                 break
             except Exception as e:
                 print(f"Warning: skipping dl3dv_colmap {record.get('obj_id', '?')}: {e}")
-                # backoff: transient filesystem stalls fail all instant
-                # retries at once; wait it out before resampling
+                # back off so transient filesystem stalls can clear before resampling
                 time.sleep(min(5.0, 0.3 * 2 ** _attempt))
                 idx = random.randint(0, len(self.records) - 1)
         else:

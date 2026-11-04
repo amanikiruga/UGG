@@ -1,19 +1,17 @@
 """MatrixCity (Li et al. 2023, BoDai/MatrixCity): Unreal Engine 5 synthetic city.
 
-STREET split only: smooth vehicle-path video (verified in-bounds 100% over
-100-frame baselines). The AERIAL split is a grid scan (~21% of the image leaves the
-view EVERY frame) — not usable as continuous video clips; excluded.
+Street split only: smooth vehicle-path video. The aerial split is a grid scan (a large part
+of the image leaves the view every frame), so it is not usable as continuous video.
 
 Layout (<data_root>/):
     small_city/street/<split>/<road>/transforms.json   frames: {frame_index, rot_mat}
     small_city/street/<split>/<road>/%04d.png          1000x1000 RGB (fov 90)
     small_city_depth/street/<split>/<road>_depth/%04d.exr  float16 R=G=B, 65504=sky
 
-Geometry (verified datasets/geometry_verification/matrixcity/check_raw_reproj.py):
+Geometry:
 - rot_mat is c2w in OpenCV axes with the ROTATION SCALED by 0.01 — normalize by
   cbrt(det). Translation kept as stored.
-- STREET depth shares the pose unit directly (divisor 1; z-depth). (Aerial would
-  need /100 — another reason it stays excluded.)
+- Street depth is z-depth in the pose unit.
 - Intrinsics from camera_angle_x (fov 90 -> fx=fy=cx=cy=500 at 1000x1000).
 - A road json may concatenate several sweeps: records are split at teleports
   (translation step > TELEPORT_FACTOR x median step or non-consecutive frame_index)
@@ -48,7 +46,7 @@ MIN_DEPTH = 1e-3
 MIN_FRAMES = 16
 TELEPORT_FACTOR = 5.0                # split record when step > factor x median step
 STREET_SPLITS = ("train", "train_dense")
-CITIES = ("small_city", "big_city")   # big_city street downloaded 2026-07-12 (phase 2)
+CITIES = ("small_city", "big_city")
 
 
 def _read_exr_r(path: str) -> np.ndarray:
@@ -82,9 +80,8 @@ class MatrixCityDataset(TartanAirDataset):
     """One record per contiguous street sweep. Reuses TartanAir geometry helpers.
 
     Frames are kept as one frames.zip per block (road/frames.zip for RGB pngs,
-    <road>_depth/frames.zip for EXR depth) for filesystem inode economy — see
-    _dl/repackage_tars_to_zip.py. transforms.json stays loose. Loader reads members
-    via zipfile (ASE/mid_air pattern)."""
+    <road>_depth/frames.zip for EXR depth) to keep the inode count low. transforms.json stays
+    loose. Members are read via zipfile."""
 
     SCENE_ID_KEY = "seq_id"   # record["seq_id"] matches captions.csv scene_id
 
