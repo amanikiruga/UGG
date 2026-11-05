@@ -35,5 +35,5 @@ h5py
 pandas
 OpenEXR
 Pillow
-# attention: FlashAttention-2 (pip install flash-attn==2.7.4.post1 --no-build-isolation);
+# Optional attention: FA2 2.8.3 wheel or 2.7.4.post1 source build (see README).
 # FlashAttention-3 is used automatically when `flash_attn_interface` is importable.

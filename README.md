@@ -62,11 +62,18 @@ python -c 'from transformers import AutoTokenizer; AutoTokenizer.from_pretrained
 conda create -n ugg python=3.12 && conda activate ugg
 pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu129
 pip install -r requirements.txt
-pip install flash-attn==2.7.4.post1 --no-build-isolation     # optional; FA3 is picked up if importable
 ```
 
-FlashAttention needs a compatible CUDA development toolkit (`nvcc`) to build. Without it,
-the model uses PyTorch's native scaled dot-product attention.
+Flash attention is recommended but not necessary. To install the prebuilt 2.8.3 flash attention wheel:
+```bash
+pip install --no-deps "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+```
+
+To install from Flash attention 2.7.4.post1 source, requires torch already installed, a C++ compiler, and Cuda 12.9 `nvcc`. 
+```bash
+pip install ninja packaging psutil setuptools wheel
+MAX_JOBS=8 pip install flash-attn==2.7.4.post1 --no-build-isolation --no-deps --no-cache-dir
+```
 
 ```bash
 export HF_HOME=/path/to/hf_cache   # where the Wan2.2 files are cached
@@ -303,6 +310,7 @@ python -m main +name=full_smoke experiment=ugg_train algorithm=ugg dataset=dummy
 ```bash
 python tests/test_cpu.py                                # CPU: imports, configs, video IO, depth decode, cameras
 python tests/gpu_smoke.py                               # GPU: all six tasks on assets/, one model load
+python tests/test_flash_attention.py                    # GPU: optional FA2 forward/backward numerical checks; requires FA2
 ```
 
 # Acknowledgements
