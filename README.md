@@ -313,6 +313,12 @@ python tests/gpu_smoke.py                               # GPU: all six tasks on 
 python tests/test_flash_attention.py                    # GPU: optional FA2 forward/backward numerical checks; requires FA2
 ```
 
+# Intended Use and Responsible Use
+UGG is intended for research on video generation and 4D scene understanding.
+Outputs may contain inaccurate geometry or synthetic content. Users should
+disclose generated content and avoid deceptive, privacy-invasive, or
+safety-critical applications without independent validation.
+
 # Acknowledgements
 
 This repo is forked from [Boyuan Chen](https://boyuan.space/)'s research template
@@ -321,3 +327,6 @@ above sentence in `README.md` and the `LICENSE` file to credit the author. The m
 [Wan2.2](https://github.com/Wan-Video/Wan2.2) and follows the layout of
 [Large Video Planner](https://github.com/buoyancy99/large-video-planner). The sample scenes in
 `assets/` come from the Bonn RGB-D Dynamic, RealEstate10K and DL3DV-10K datasets.
+
+
+
